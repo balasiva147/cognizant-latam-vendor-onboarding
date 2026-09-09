@@ -17,6 +17,7 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 - A separate required rejection reason for every rejected document
 - A vendor correction view showing only rejected documents and their previous rejection reasons
 - Repeatable reject, resubmit, and approve cycles
+- Automatic DeepL translation to English after every requested document is approved
 
 ## Technology and storage
 
@@ -24,7 +25,8 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 - Backend: Node.js, Express, MySQL2, and Multer in `server/src/server.js`
 - Database: MySQL 8
 - Demo notifications: MySQL records displayed in the application's **Mail outbox**; no real email is sent
-- Uploaded files: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/originals/`
+- Uploaded originals: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/originals/`
+- English translations: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/translated/`
 
 Each upload creates an immutable version record in MySQL. When procurement rejects an upload, its stored filename is marked with `rejected-vN`; a replacement upload receives the next version number. The canonical document name is not changed.
 
@@ -36,6 +38,7 @@ Install:
 - Node.js 18 or later and npm
 - MySQL Server 8 and MySQL Workbench, or another MySQL client
 - Python 3 for the simple frontend web server
+- A DeepL API Developer or API Free key for automatic document translation
 
 Check the command-line tools:
 
@@ -100,10 +103,16 @@ Expected tables:
 - `document_uploads`
 - `document_review_events`
 - `vendor_notifications`
+- `document_translations`
 
 ### Existing demo database
 
-If the database was created using an older version of this repository, back it up and run `server/migrations/002_workflow_states.sql`. Do not run that migration for a fresh database; the current `server/schema.sql` already contains the latest states and notification table.
+If the database was created using an older version of this repository, back it up and run the applicable migrations in order:
+
+1. `server/migrations/002_workflow_states.sql`
+2. `server/migrations/003_document_translations.sql`
+
+For a fresh database, run only `server/schema.sql`; it already includes all current tables.
 
 ## 3. Configure the backend
 
@@ -131,10 +140,17 @@ DB_PORT=3306
 DB_USER=vendor_app
 DB_PASSWORD=replace_with_your_local_password
 DB_NAME=vendor_onboarding
-MAX_UPLOAD_MB=15
+MAX_UPLOAD_MB=10
+DEEPL_API_KEY=replace_with_your_deepl_api_key
+DEEPL_API_URL=https://api-free.deepl.com
+DEEPL_TARGET_LANGUAGE=EN-US
+DEEPL_POLL_INTERVAL_MS=1500
+DEEPL_POLL_TIMEOUT_MS=180000
 ```
 
 `DB_PASSWORD` must exactly match the password assigned to `vendor_app`. The `.env` file and `server/uploads` directory are ignored by Git.
+
+Use `https://api-free.deepl.com` for an API Free key ending in `:fx`. If DeepL identifies the account as API Developer and supplies a non-Free endpoint, set `DEEPL_API_URL=https://api.deepl.com`. Never put the API key in `index.html` or commit `server/.env`.
 
 ## 4. Install dependencies and start the API
 
@@ -272,6 +288,12 @@ Expected result:
 - Both documents are approved.
 - The ticket displays **Approved**.
 - The database ticket and document states are `LOCAL_PROCUREMENT_ACCEPTED`.
+- Two background translation records progress through `PENDING`, `PROCESSING`, and `COMPLETED`.
+- English files are written under `server/uploads/<vendor-id>-<sanitized-vendor-name>/translated/`.
+- Translated filenames contain `translated-en-us-vN` and can be retrieved through the translation download endpoint.
+- Reopening the Procurement ticket shows the translation status and a **View English** button after completion.
+
+Translation runs after the approval transaction commits, so a temporary DeepL failure does not undo procurement approval. A failed provider request is recorded as `FAILED` with diagnostic text in `document_translations`.
 
 ### G. Verify separate reasons for two rejected documents
 
@@ -304,6 +326,11 @@ ORDER BY id DESC;
 SELECT notification_type, subject, delivery_status, rejected_documents
 FROM vendor_notifications
 ORDER BY id DESC;
+
+SELECT target_language, provider, status, translated_file_name,
+       storage_path, billed_characters, last_error, completed_at
+FROM document_translations
+ORDER BY id DESC;
 ```
 
 ## Workflow states
@@ -327,6 +354,7 @@ Rejection is recorded as an event in `document_review_events`. The affected docu
 | `GET` | `/api/tickets/<ticket-number>` | Retrieve one ticket |
 | `POST` | `/api/ticket-documents/<document-id>/upload` | Upload a requested document version |
 | `GET` | `/api/uploads/<upload-id>` | View an uploaded file |
+| `GET` | `/api/translations/<translation-id>` | View a completed English translation |
 | `POST` | `/api/tickets/<ticket-number>/review` | Submit one or more procurement decisions |
 | `GET` | `/api/notifications?email=<vendor-email>` | List notifications for one vendor |
 
@@ -365,6 +393,14 @@ Stop the existing process using port 3000 or 8765 before starting another server
 - Enter a separate non-empty reason for every rejected document.
 - Select **Submit review** to persist the decisions.
 
+### DeepL translation fails
+
+- Confirm `DEEPL_API_KEY`, `DEEPL_API_URL`, and `DEEPL_TARGET_LANGUAGE` in `server/.env`.
+- Confirm the key has remaining document-translation allowance.
+- Check `document_translations.last_error` for the provider response.
+- Corporate proxies or web filters may block `api-free.deepl.com` as a Generative AI service. Use an approved network or request an organizational security exception; do not disable TLS verification.
+- Restart the API after changing DeepL configuration.
+
 ## Repository structure
 
 ```text
@@ -376,10 +412,15 @@ Stop the existing process using port 3000 or 8765 before starting another server
     ├── package.json
     ├── schema.sql
     ├── migrations
-    │   └── 002_workflow_states.sql
+    │   ├── 002_workflow_states.sql
+    │   └── 003_document_translations.sql
     ├── src
-    │   └── server.js
+    │   ├── server.js
+    │   └── translation.js
     └── uploads                 # Created locally and ignored by Git
+        └── <vendor-id>-<vendor-name>
+            ├── originals
+            └── translated
 ```
 
 ## Demo limitations

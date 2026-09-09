@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const mysql = require('mysql2/promise');
+const { createTranslationService } = require('./translation');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const port = Number(process.env.PORT || 3000);
@@ -22,6 +23,7 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   namedPlaceholders: true
 });
+const translationService = createTranslationService({ pool, uploadRoot });
 
 const allowedExtensions = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx']);
 const activeDocumentNames = new Set(['RFC Tax Certificate', 'Proof of Address']);
@@ -133,7 +135,11 @@ app.get('/api/tickets', async (req, res, next) => {
               d.id AS document_id, d.document_name, d.status AS document_status,
               d.rejection_reason,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
-              u.size_bytes, u.version_number, u.uploaded_at
+              u.size_bytes, u.version_number, u.uploaded_at,
+              tr.id AS translation_id, tr.status AS translation_status,
+              tr.target_language AS translation_target_language,
+              tr.translated_file_name, tr.last_error AS translation_error,
+              tr.completed_at AS translation_completed_at
        FROM onboarding_tickets t
        JOIN vendors v ON v.id = t.vendor_id
        JOIN ticket_documents d ON d.ticket_id = t.id
@@ -142,9 +148,11 @@ app.get('/api/tickets', async (req, res, next) => {
          WHERE du.ticket_document_id = d.id
          ORDER BY du.version_number DESC LIMIT 1
        )
+       LEFT JOIN document_translations tr
+         ON tr.document_upload_id = u.id AND tr.target_language = ?
        ${emailFilter}
        ORDER BY t.created_at DESC, d.id`,
-      parameters
+      [translationService.targetLanguage, ...parameters]
     );
     const tickets = new Map();
     for (const row of rows) {
@@ -171,7 +179,15 @@ app.get('/api/tickets', async (req, res, next) => {
         mimeType: row.mime_type,
         sizeBytes: row.size_bytes ? Number(row.size_bytes) : null,
         version: row.version_number ? Number(row.version_number) : 0,
-        uploadedAt: row.uploaded_at
+        uploadedAt: row.uploaded_at,
+        translation: row.translation_id ? {
+          id: Number(row.translation_id),
+          status: row.translation_status,
+          targetLanguage: row.translation_target_language,
+          fileName: row.translated_file_name,
+          error: row.translation_error,
+          completedAt: row.translation_completed_at
+        } : null
       });
     }
     res.json([...tickets.values()]);
@@ -186,7 +202,11 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
               d.id AS document_id, d.document_name, d.status AS document_status,
               d.rejection_reason, (d.status = 'INIT') AS can_upload,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
-              u.size_bytes, u.version_number, u.uploaded_at
+              u.size_bytes, u.version_number, u.uploaded_at,
+              tr.id AS translation_id, tr.status AS translation_status,
+              tr.target_language AS translation_target_language,
+              tr.translated_file_name, tr.last_error AS translation_error,
+              tr.completed_at AS translation_completed_at
        FROM onboarding_tickets t
        JOIN vendors v ON v.id = t.vendor_id
        JOIN ticket_documents d ON d.ticket_id = t.id
@@ -195,9 +215,11 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
          WHERE du.ticket_document_id = d.id
          ORDER BY du.version_number DESC LIMIT 1
        )
+       LEFT JOIN document_translations tr
+         ON tr.document_upload_id = u.id AND tr.target_language = ?
        WHERE t.ticket_number = ?
        ORDER BY d.id`,
-      [req.params.ticketNumber]
+      [translationService.targetLanguage, req.params.ticketNumber]
     );
     if (!rows.length) return res.status(404).json({ error: 'Ticket not found.' });
     res.json(rows);
@@ -292,6 +314,22 @@ app.get('/api/uploads/:uploadId', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get('/api/translations/:translationId', async (req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT translated_file_name, storage_path, mime_type
+       FROM document_translations WHERE id = ? AND status = 'COMPLETED'`,
+      [req.params.translationId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Completed translation not found.' });
+    const filePath = path.resolve(uploadRoot, rows[0].storage_path);
+    if (!filePath.startsWith(`${uploadRoot}${path.sep}`)) return res.status(400).json({ error: 'Invalid storage path.' });
+    res.type(rows[0].mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(rows[0].translated_file_name)}`);
+    res.sendFile(filePath);
+  } catch (error) { next(error); }
+});
+
 app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
   const { note, reviewedByEmail } = req.body;
   const decision = req.body.decision === 'APPROVED'
@@ -362,7 +400,13 @@ app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
       );
     }
     await connection.commit();
-    res.json({ documentId: Number(req.params.documentId), decision, ticketStatus: nextStatus });
+    if (nextStatus === 'LOCAL_PROCUREMENT_ACCEPTED') translationService.queueTicket(ticketId);
+    res.json({
+      documentId: Number(req.params.documentId),
+      decision,
+      ticketStatus: nextStatus,
+      translationQueued: nextStatus === 'LOCAL_PROCUREMENT_ACCEPTED'
+    });
   } catch (error) {
     await connection.rollback();
     next(error);
@@ -489,11 +533,13 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
     }
 
     await connection.commit();
+    if (ticketStatus === 'LOCAL_PROCUREMENT_ACCEPTED') translationService.queueTicket(ticket.id);
     res.json({
       ticketNumber: ticket.ticket_number,
       ticketStatus,
       rejectedDocuments,
-      notificationId
+      notificationId,
+      translationQueued: ticketStatus === 'LOCAL_PROCUREMENT_ACCEPTED'
     });
   } catch (error) {
     await connection.rollback();
