@@ -1,0 +1,68 @@
+USE vendor_onboarding;
+
+-- Keep old and new values temporarily so an existing demo database can migrate
+-- without losing rows.
+ALTER TABLE onboarding_tickets
+  MODIFY status ENUM(
+    'AWAITING_VENDOR','UNDER_REVIEW','CHANGES_REQUESTED','APPROVED',
+    'INIT','DOCUMENTS_UPLOADED','LOCAL_PROCUREMENT_ACCEPTED'
+  ) NOT NULL DEFAULT 'INIT';
+
+UPDATE onboarding_tickets
+SET status = CASE status
+  WHEN 'APPROVED' THEN 'LOCAL_PROCUREMENT_ACCEPTED'
+  WHEN 'UNDER_REVIEW' THEN 'DOCUMENTS_UPLOADED'
+  ELSE 'INIT'
+END;
+
+ALTER TABLE onboarding_tickets
+  MODIFY status ENUM('INIT','DOCUMENTS_UPLOADED','LOCAL_PROCUREMENT_ACCEPTED')
+  NOT NULL DEFAULT 'INIT';
+
+ALTER TABLE ticket_documents
+  MODIFY status ENUM(
+    'REQUESTED','UPLOADED','APPROVED','REJECTED',
+    'INIT','DOCUMENTS_UPLOADED','LOCAL_PROCUREMENT_ACCEPTED'
+  ) NOT NULL DEFAULT 'INIT';
+
+UPDATE ticket_documents
+SET status = CASE status
+  WHEN 'APPROVED' THEN 'LOCAL_PROCUREMENT_ACCEPTED'
+  WHEN 'UPLOADED' THEN 'DOCUMENTS_UPLOADED'
+  ELSE 'INIT'
+END;
+
+ALTER TABLE ticket_documents
+  MODIFY status ENUM('INIT','DOCUMENTS_UPLOADED','LOCAL_PROCUREMENT_ACCEPTED')
+  NOT NULL DEFAULT 'INIT';
+
+ALTER TABLE document_review_events
+  MODIFY decision ENUM('APPROVED','LOCAL_PROCUREMENT_ACCEPTED','REJECTED') NOT NULL;
+
+UPDATE document_review_events
+SET decision = 'LOCAL_PROCUREMENT_ACCEPTED'
+WHERE decision = 'APPROVED';
+
+ALTER TABLE document_review_events
+  MODIFY decision ENUM('LOCAL_PROCUREMENT_ACCEPTED','REJECTED') NOT NULL;
+
+CREATE TABLE IF NOT EXISTS vendor_notifications (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  ticket_id BIGINT UNSIGNED NOT NULL,
+  vendor_id BIGINT UNSIGNED NOT NULL,
+  notification_type ENUM('DOCUMENTS_REJECTED') NOT NULL,
+  subject VARCHAR(250) NOT NULL,
+  message VARCHAR(2000) NOT NULL,
+  rejected_documents JSON NOT NULL,
+  delivery_status ENUM('PENDING','SENT','FAILED','READ') NOT NULL DEFAULT 'PENDING',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  sent_at TIMESTAMP NULL,
+  read_at TIMESTAMP NULL,
+  PRIMARY KEY (id),
+  KEY idx_notification_vendor (vendor_id, delivery_status, created_at),
+  KEY idx_notification_ticket (ticket_id, created_at),
+  CONSTRAINT fk_notification_ticket FOREIGN KEY (ticket_id) REFERENCES onboarding_tickets(id)
+    ON UPDATE CASCADE ON DELETE CASCADE,
+  CONSTRAINT fk_notification_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(id)
+    ON UPDATE CASCADE ON DELETE CASCADE
+) ENGINE=InnoDB;

@@ -69,4 +69,18 @@ The `server` folder contains a Node.js API and MySQL 8 schema. MySQL stores work
 
 The initial endpoints create and retrieve tickets, upload and view document versions, and approve or reject documents. Authentication and email delivery are intentionally deferred until the next iteration.
 
+### Workflow states
+
+| State | Meaning |
+| --- | --- |
+| `INIT` | Vendor action is required. New and rejected documents show an upload option. |
+| `DOCUMENTS_UPLOADED` | All currently required files have been uploaded and are ready for Local Procurement review. |
+| `LOCAL_PROCUREMENT_ACCEPTED` | Local Procurement has accepted every required document. |
+
+If Local Procurement rejects a document, that document and its ticket return to `INIT`. The rejection text is retained, a `DOCUMENTS_REJECTED` notification is created for the vendor, and the next upload becomes a new immutable version. This repeats until all documents are accepted.
+
+For a database created with the previous schema, run `server/migrations/002_workflow_states.sql` in MySQL Workbench. For a fresh database, run only `server/schema.sql` because it already contains the new states.
+
+Local Procurement can submit several decisions together through `POST /api/tickets/:ticketNumber/review`. Vendor alerts can be read through `GET /api/vendors/:email/notifications`.
+
 > This is a functional prototype, not a production system. Do not use real vendor documents or confidential information. Production storage must be encrypted and governed by appropriate access, retention, scanning, and audit controls.
