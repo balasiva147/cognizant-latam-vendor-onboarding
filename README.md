@@ -14,23 +14,25 @@ A dependency-free browser prototype for country-specific vendor onboarding acros
 
 ## Run locally
 
-### Option 1: Python
+Complete the MySQL setup below first and make sure `server/.env` contains the `vendor_app` credentials.
 
-1. Clone the repository and enter its folder.
-2. Start a local web server:
+In terminal 1, start the API:
 
-   ```bash
-   python -m http.server 8765
-   ```
+```bash
+cd server
+npm install
+npm start
+```
 
-   On Windows, use `py -m http.server 8765` if `python` is unavailable.
-3. Open <http://127.0.0.1:8765>.
+Confirm <http://127.0.0.1:3000/api/health> returns `{"status":"ok","database":"connected"}`.
 
-### Option 2: VS Code
+In terminal 2, from the repository root, start the frontend:
 
-Open the repository in VS Code, install the **Live Server** extension, right-click `index.html`, and choose **Open with Live Server**.
+```bash
+python -m http.server 8765
+```
 
-The page can also be opened directly, but a local server provides more consistent browser-storage and document-preview behavior.
+On Windows, use `py -m http.server 8765` if `python` is unavailable. Open <http://127.0.0.1:8765>. Use this exact host and port because the demo API allows that frontend origin.
 
 ## Demo accounts
 
@@ -38,17 +40,27 @@ The page can also be opened directly, but a local server provides more consisten
 - Vendor: use the email entered on an onboarding ticket / `demo123`
 - Vendor preview: `vendor@example.com` / `demo123`
 
+## Test the complete workflow
+
+1. Sign in as Procurement and choose a country and language.
+2. Select **Onboard vendor**, enter vendor details, select the required documents, and submit. The ticket and initial alert are stored in MySQL.
+3. Open **Mail outbox**, then use the vendor link, or sign out and sign in as Vendor using the same vendor email and `demo123`.
+4. Open the request, choose a file for every requested document, and submit.
+5. Sign back in as Procurement, open the ticket, and view each uploaded file.
+6. Approve some documents and reject at least one. Enter rejection text and submit the review.
+7. Open the vendor link from the new alert. The rejected document shows the rejection text and a new upload control.
+8. Upload the corrected document and submit it.
+9. Sign in as Procurement and approve the corrected version. When every document is accepted, the ticket shows **Approved** (`LOCAL_PROCUREMENT_ACCEPTED` in MySQL).
+
 ## Continue development
 
-The UI, styling, data, and workflow logic currently live in `index.html`. Recommended next steps are to split it into modules, add a backend API and database, and integrate enterprise identity, secure object storage, malware scanning, audit logging, and transactional email.
+The frontend currently lives in `index.html`, and the API lives in `server/src/server.js`. Recommended next steps are to split the frontend into modules and integrate enterprise identity, object storage, malware scanning, audit logging, and transactional email.
 
 ## Prototype storage
 
-- Workflow and ticket metadata: browser `localStorage`
-- Uploaded document contents: browser `IndexedDB`
-- Email alerts: simulated in the in-app **Mail outbox**, including a working vendor-access link
-
-Browser data is isolated by origin. To retain the same test data between sessions, run the app on the same host and port. Clearing browser site data resets the prototype.
+- Vendors, tickets, workflow states, upload metadata, checksums, review history, and notifications: MySQL
+- Uploaded file contents: local, git-ignored `server/uploads` directory
+- Email delivery: represented by persistent MySQL notification records displayed in **Mail outbox**
 
 ## Demo backend and MySQL
 

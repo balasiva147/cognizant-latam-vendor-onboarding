@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS vendor_notifications (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   ticket_id BIGINT UNSIGNED NOT NULL,
   vendor_id BIGINT UNSIGNED NOT NULL,
-  notification_type ENUM('DOCUMENTS_REJECTED') NOT NULL,
+  notification_type ENUM('DOCUMENTS_REQUESTED','DOCUMENTS_REJECTED') NOT NULL,
   subject VARCHAR(250) NOT NULL,
   message VARCHAR(2000) NOT NULL,
   rejected_documents JSON NOT NULL,
@@ -66,3 +66,6 @@ CREATE TABLE IF NOT EXISTS vendor_notifications (
   CONSTRAINT fk_notification_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(id)
     ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE=InnoDB;
+
+ALTER TABLE vendor_notifications
+  MODIFY notification_type ENUM('DOCUMENTS_REQUESTED','DOCUMENTS_REJECTED') NOT NULL;

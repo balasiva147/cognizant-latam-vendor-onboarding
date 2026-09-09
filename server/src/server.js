@@ -76,12 +76,77 @@ app.post('/api/tickets', async (req, res, next) => {
         [ticketResult.insertId, documentName]
       );
     }
+    await connection.execute(
+      `INSERT INTO vendor_notifications
+       (ticket_id, vendor_id, notification_type, subject, message, rejected_documents)
+       VALUES (?, ?, 'DOCUMENTS_REQUESTED', ?, ?, ?)`,
+      [ticketResult.insertId, vendorResult.insertId,
+        `Documents requested for ${ticketNumber}`,
+        `Cognizant Local Procurement requested ${documents.length} documents. Sign in to upload them.`,
+        JSON.stringify(documents.map(documentName => ({ documentName })))]
+    );
     await connection.commit();
     res.status(201).json({ id: ticketResult.insertId, ticketNumber });
   } catch (error) {
     await connection.rollback();
     next(error);
   } finally { connection.release(); }
+});
+
+app.get('/api/tickets', async (req, res, next) => {
+  try {
+    const parameters = [];
+    const emailFilter = req.query.email ? 'WHERE v.email = ?' : '';
+    if (req.query.email) parameters.push(req.query.email);
+    const [rows] = await pool.execute(
+      `SELECT t.ticket_number, t.country_code, t.communication_language, t.status,
+              t.created_at, v.legal_name, v.email, v.registered_address,
+              d.id AS document_id, d.document_name, d.status AS document_status,
+              d.rejection_reason,
+              u.id AS latest_upload_id, u.original_file_name, u.mime_type,
+              u.size_bytes, u.version_number, u.uploaded_at
+       FROM onboarding_tickets t
+       JOIN vendors v ON v.id = t.vendor_id
+       JOIN ticket_documents d ON d.ticket_id = t.id
+       LEFT JOIN document_uploads u ON u.id = (
+         SELECT du.id FROM document_uploads du
+         WHERE du.ticket_document_id = d.id
+         ORDER BY du.version_number DESC LIMIT 1
+       )
+       ${emailFilter}
+       ORDER BY t.created_at DESC, d.id`,
+      parameters
+    );
+    const tickets = new Map();
+    for (const row of rows) {
+      if (!tickets.has(row.ticket_number)) {
+        tickets.set(row.ticket_number, {
+          ticketNumber: row.ticket_number,
+          vendorName: row.legal_name,
+          vendorEmail: row.email,
+          address: row.registered_address,
+          countryCode: row.country_code,
+          language: row.communication_language,
+          status: row.status,
+          createdAt: row.created_at,
+          documents: []
+        });
+      }
+      tickets.get(row.ticket_number).documents.push({
+        id: Number(row.document_id),
+        name: row.document_name,
+        status: row.document_status,
+        rejectionReason: row.rejection_reason,
+        latestUploadId: row.latest_upload_id ? Number(row.latest_upload_id) : null,
+        fileName: row.original_file_name,
+        mimeType: row.mime_type,
+        sizeBytes: row.size_bytes ? Number(row.size_bytes) : null,
+        version: row.version_number ? Number(row.version_number) : 0,
+        uploadedAt: row.uploaded_at
+      });
+    }
+    res.json([...tickets.values()]);
+  } catch (error) { next(error); }
 });
 
 app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
@@ -377,6 +442,26 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
     await connection.rollback();
     next(error);
   } finally { connection.release(); }
+});
+
+app.get('/api/notifications', async (req, res, next) => {
+  try {
+    const parameters = [];
+    const emailFilter = req.query.email ? 'WHERE v.email = ?' : '';
+    if (req.query.email) parameters.push(req.query.email);
+    const [rows] = await pool.execute(
+      `SELECT n.id, t.ticket_number, n.notification_type, n.subject, n.message,
+              n.rejected_documents, n.delivery_status, n.created_at, n.sent_at, n.read_at,
+              v.email AS vendor_email
+       FROM vendor_notifications n
+       JOIN vendors v ON v.id = n.vendor_id
+       JOIN onboarding_tickets t ON t.id = n.ticket_id
+       ${emailFilter}
+       ORDER BY n.created_at DESC`,
+      parameters
+    );
+    res.json(rows);
+  } catch (error) { next(error); }
 });
 
 app.get('/api/vendors/:email/notifications', async (req, res, next) => {
