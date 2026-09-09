@@ -6,7 +6,7 @@ A dependency-free browser prototype for country-specific vendor onboarding acros
 
 - Procurement and vendor login experiences
 - Country and communication-language selection
-- Country-specific document requirements
+- A focused two-document demo: RFC Tax Certificate and Proof of Address
 - Onboarding tickets and a vendor notification outbox
 - Document uploads, viewing, approval, rejection, and resubmission
 - English, Spanish, and Portuguese interface copy
@@ -47,8 +47,8 @@ On Windows, use `py -m http.server 8765` if `python` is unavailable. Open <http:
 3. Open **Mail outbox**, then use the vendor link, or sign out and sign in as Vendor using the same vendor email and `demo123`.
 4. Open the request, choose a file for every requested document, and submit.
 5. Sign back in as Procurement, open the ticket, and view each uploaded file.
-6. Approve some documents and reject at least one. Enter rejection text and submit the review.
-7. Open the vendor link from the new alert. The rejected document shows the rejection text and a new upload control.
+6. Select each document to review, stage an approval or rejection, and enter a separate reason for every rejection. No decision is saved until **Submit review** is selected.
+7. Open the vendor link from the new alert. Only rejected documents are shown, with the prior rejection reason and a new upload control.
 8. Upload the corrected document and submit it.
 9. Sign in as Procurement and approve the corrected version. When every document is accepted, the ticket shows **Approved** (`LOCAL_PROCUREMENT_ACCEPTED` in MySQL).
 
@@ -59,7 +59,7 @@ The frontend currently lives in `index.html`, and the API lives in `server/src/s
 ## Prototype storage
 
 - Vendors, tickets, workflow states, upload metadata, checksums, review history, and notifications: MySQL
-- Uploaded file contents: local, git-ignored `server/uploads` directory
+- Uploaded file contents: local, git-ignored `server/uploads/<vendor legal name>/originals` directory
 - Email delivery: represented by persistent MySQL notification records displayed in **Mail outbox**
 
 ## Demo backend and MySQL
@@ -90,6 +90,8 @@ The initial endpoints create and retrieve tickets, upload and view document vers
 | `LOCAL_PROCUREMENT_ACCEPTED` | Local Procurement has accepted every required document. |
 
 If Local Procurement rejects a document, that document and its ticket return to `INIT`. The rejection text is retained, a `DOCUMENTS_REJECTED` notification is created for the vendor, and the next upload becomes a new immutable version. This repeats until all documents are accepted.
+
+The canonical document name stays unchanged in MySQL. A rejected upload's stored filename is marked with `rejected-vN`, while the vendor screen displays the document as **Rejected (vN)**. This preserves an auditable document identity while making rejected versions obvious.
 
 For a database created with the previous schema, run `server/migrations/002_workflow_states.sql` in MySQL Workbench. For a fresh database, run only `server/schema.sql` because it already contains the new states.
 

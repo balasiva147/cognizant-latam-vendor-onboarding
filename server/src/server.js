@@ -24,21 +24,47 @@ const pool = mysql.createPool({
 });
 
 const allowedExtensions = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx']);
-const storage = multer.diskStorage({
-  destination: uploadRoot,
-  filename: (_req, file, done) => {
-    const extension = path.extname(file.originalname).toLowerCase();
-    done(null, `${crypto.randomUUID()}${extension}`);
-  }
-});
+const activeDocumentNames = new Set(['RFC Tax Certificate', 'Proof of Address']);
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: maxUploadBytes, files: 1 },
   fileFilter: (_req, file, done) => {
     const extension = path.extname(file.originalname).toLowerCase();
     done(allowedExtensions.has(extension) ? null : new Error('Unsupported file type'), allowedExtensions.has(extension));
   }
 });
+
+function safeFolderName(value) {
+  const safe = String(value || 'vendor')
+    .normalize('NFKD')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '-')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '')
+    .trim();
+  return safe.slice(0, 100) || 'vendor';
+}
+
+function safeFileStem(value) {
+  return safeFolderName(value).replace(/\s+/g, '-').toLowerCase();
+}
+
+async function renameRejectedUpload(connection, uploadRow) {
+  if (!uploadRow?.storage_path || uploadRow.stored_file_name.includes('-rejected-v')) return;
+  const extension = path.extname(uploadRow.stored_file_name);
+  const stem = path.basename(uploadRow.stored_file_name, extension);
+  const rejectedName = `${stem}-rejected-v${uploadRow.version_number}${extension}`;
+  const oldPath = path.resolve(uploadRoot, uploadRow.storage_path);
+  const newRelativePath = path.join(path.dirname(uploadRow.storage_path), rejectedName);
+  const newPath = path.resolve(uploadRoot, newRelativePath);
+  if (!oldPath.startsWith(`${uploadRoot}${path.sep}`) || !newPath.startsWith(`${uploadRoot}${path.sep}`)) {
+    throw new Error('Invalid upload storage path.');
+  }
+  await fs.promises.rename(oldPath, newPath);
+  await connection.execute(
+    'UPDATE document_uploads SET stored_file_name = ?, storage_path = ? WHERE id = ?',
+    [rejectedName, newRelativePath, uploadRow.id]
+  );
+}
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:8765' }));
@@ -55,6 +81,9 @@ app.post('/api/tickets', async (req, res, next) => {
   const { ticketNumber, vendorName, vendorEmail, address, countryCode, language, documents } = req.body;
   if (![ticketNumber, vendorName, vendorEmail, address, countryCode, language].every(Boolean) || !Array.isArray(documents) || !documents.length) {
     return res.status(400).json({ error: 'Ticket, vendor, country, language, and documents are required.' });
+  }
+  if (documents.some(documentName => !activeDocumentNames.has(documentName))) {
+    return res.status(400).json({ error: 'Only RFC Tax Certificate and Proof of Address are available in this demo.' });
   }
 
   const connection = await pool.getConnection();
@@ -178,28 +207,27 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
 app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), async (req, res, next) => {
   if (!req.file) return res.status(400).json({ error: 'A document file is required.' });
   const uploadedByEmail = req.body.uploadedByEmail;
-  if (!uploadedByEmail) {
-    fs.rmSync(req.file.path, { force: true });
-    return res.status(400).json({ error: 'uploadedByEmail is required.' });
-  }
+  if (!uploadedByEmail) return res.status(400).json({ error: 'uploadedByEmail is required.' });
 
   const connection = await pool.getConnection();
+  let savedPath = null;
   try {
-    const bytes = await fs.promises.readFile(req.file.path);
-    const checksum = crypto.createHash('sha256').update(bytes).digest('hex');
+    const checksum = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     await connection.beginTransaction();
     const [documents] = await connection.execute(
-      'SELECT id, ticket_id, status FROM ticket_documents WHERE id = ? FOR UPDATE',
+      `SELECT d.id, d.ticket_id, d.status, d.document_name, v.legal_name
+       FROM ticket_documents d
+       JOIN onboarding_tickets t ON t.id = d.ticket_id
+       JOIN vendors v ON v.id = t.vendor_id
+       WHERE d.id = ? FOR UPDATE`,
       [req.params.documentId]
     );
     if (!documents.length) {
       await connection.rollback();
-      fs.rmSync(req.file.path, { force: true });
       return res.status(404).json({ error: 'Requested document not found.' });
     }
     if (documents[0].status !== 'INIT') {
       await connection.rollback();
-      fs.rmSync(req.file.path, { force: true });
       return res.status(409).json({ error: 'Only documents in INIT state can receive a new upload.' });
     }
     const [versions] = await connection.execute(
@@ -207,13 +235,22 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
       [req.params.documentId]
     );
     const version = versions[0].next_version;
+    const vendorFolder = safeFolderName(documents[0].legal_name);
+    const originalsFolder = path.join(uploadRoot, vendorFolder, 'originals');
+    await fs.promises.mkdir(originalsFolder, { recursive: true });
+    const extension = path.extname(req.file.originalname).toLowerCase();
+    const storedFileName = `${safeFileStem(documents[0].document_name)}-v${version}-${crypto.randomUUID()}${extension}`;
+    const relativeStoragePath = path.join(vendorFolder, 'originals', storedFileName);
+    savedPath = path.resolve(uploadRoot, relativeStoragePath);
+    if (!savedPath.startsWith(`${uploadRoot}${path.sep}`)) throw new Error('Invalid upload destination.');
+    await fs.promises.writeFile(savedPath, req.file.buffer, { flag: 'wx' });
     const [result] = await connection.execute(
       `INSERT INTO document_uploads
        (ticket_document_id, version_number, original_file_name, stored_file_name,
         storage_path, mime_type, size_bytes, sha256, uploaded_by_email)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [req.params.documentId, version, req.file.originalname, req.file.filename,
-        req.file.filename, req.file.mimetype || 'application/octet-stream', req.file.size,
+      [req.params.documentId, version, req.file.originalname, storedFileName,
+        relativeStoragePath, req.file.mimetype || 'application/octet-stream', req.file.size,
         checksum, uploadedByEmail]
     );
     await connection.execute(
@@ -234,7 +271,7 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
     res.status(201).json({ uploadId: result.insertId, version, sha256: checksum, ticketStatus });
   } catch (error) {
     await connection.rollback();
-    fs.rmSync(req.file.path, { force: true });
+    if (savedPath) fs.rmSync(savedPath, { force: true });
     next(error);
   } finally { connection.release(); }
 });
@@ -265,7 +302,7 @@ app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
   try {
     await connection.beginTransaction();
     const [uploads] = await connection.execute(
-      `SELECT u.id FROM document_uploads u
+      `SELECT u.id, u.storage_path, u.stored_file_name, u.version_number FROM document_uploads u
        JOIN ticket_documents d ON d.id = u.ticket_document_id
        WHERE u.ticket_document_id = ? AND d.status = 'DOCUMENTS_UPLOADED'
        ORDER BY u.version_number DESC LIMIT 1`,
@@ -275,6 +312,7 @@ app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
       await connection.rollback();
       return res.status(409).json({ error: 'No unreviewed upload is available.' });
     }
+    if (decision === 'REJECTED') await renameRejectedUpload(connection, uploads[0]);
     await connection.execute(
       `UPDATE ticket_documents SET status = ?, rejection_reason = ? WHERE id = ?`,
       [decision === 'REJECTED' ? 'INIT' : 'LOCAL_PROCUREMENT_ACCEPTED', decision === 'REJECTED' ? note : null, req.params.documentId]
@@ -362,10 +400,16 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
     const ticket = tickets[0];
     const [documents] = await connection.execute(
       `SELECT d.id, d.document_name, d.status,
-              (SELECT u.id FROM document_uploads u
-               WHERE u.ticket_document_id = d.id
-               ORDER BY u.version_number DESC LIMIT 1) AS latest_upload_id
-       FROM ticket_documents d WHERE d.ticket_id = ? FOR UPDATE`,
+              u.id AS latest_upload_id, u.storage_path AS latest_storage_path,
+              u.stored_file_name AS latest_stored_file_name,
+              u.version_number AS latest_version_number
+       FROM ticket_documents d
+       LEFT JOIN document_uploads u ON u.id = (
+         SELECT du.id FROM document_uploads du
+         WHERE du.ticket_document_id = d.id
+         ORDER BY du.version_number DESC LIMIT 1
+       )
+       WHERE d.ticket_id = ? FOR UPDATE`,
       [ticket.id]
     );
     const byId = new Map(documents.map(document => [Number(document.id), document]));
@@ -380,6 +424,14 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
       if (document.status !== 'DOCUMENTS_UPLOADED' || !document.latest_upload_id) {
         await connection.rollback();
         return res.status(409).json({ error: `${document.document_name} has no unreviewed upload.` });
+      }
+      if (item.decision === 'REJECTED') {
+        await renameRejectedUpload(connection, {
+          id: document.latest_upload_id,
+          storage_path: document.latest_storage_path,
+          stored_file_name: document.latest_stored_file_name,
+          version_number: document.latest_version_number
+        });
       }
       const documentStatus = item.decision === 'REJECTED' ? 'INIT' : 'LOCAL_PROCUREMENT_ACCEPTED';
       await connection.execute(
