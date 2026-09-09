@@ -50,4 +50,23 @@ The UI, styling, data, and workflow logic currently live in `index.html`. Recomm
 
 Browser data is isolated by origin. To retain the same test data between sessions, run the app on the same host and port. Clearing browser site data resets the prototype.
 
+## Demo backend and MySQL
+
+The `server` folder contains a Node.js API and MySQL 8 schema. MySQL stores workflow data and file metadata; uploaded file bytes are kept in the local, git-ignored `server/uploads` folder.
+
+1. In MySQL Workbench, connect to the local `MySQL80` server and run `server/schema.sql`.
+2. Create the restricted `vendor_app` user using the commented example at the bottom of that file. Choose your own strong local password.
+3. Copy `server/.env.example` to `server/.env` and enter the same database password.
+4. Install and start the API:
+
+   ```bash
+   cd server
+   npm install
+   npm start
+   ```
+
+5. Verify the connection at <http://127.0.0.1:3000/api/health>.
+
+The initial endpoints create and retrieve tickets, upload and view document versions, and approve or reject documents. Authentication and email delivery are intentionally deferred until the next iteration.
+
 > This is a functional prototype, not a production system. Do not use real vendor documents or confidential information. Production storage must be encrypted and governed by appropriate access, retention, scanning, and audit controls.
