@@ -374,11 +374,15 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
   if (!reviewedByEmail || !Array.isArray(decisions) || !decisions.length) {
     return res.status(400).json({ error: 'Reviewer and at least one document decision are required.' });
   }
-  const normalized = decisions.map(item => ({
-    documentId: Number(item.documentId),
-    decision: item.decision === 'APPROVED' ? 'LOCAL_PROCUREMENT_ACCEPTED' : item.decision,
-    note: String(item.note || '').trim()
-  }));
+  const normalized = decisions.map(item => {
+    const submittedDecision = String(item.decision || '').trim().toUpperCase();
+    return {
+      documentId: Number(item.documentId),
+      decision: submittedDecision === 'APPROVED'
+        ? 'LOCAL_PROCUREMENT_ACCEPTED' : submittedDecision,
+      note: String(item.note || '').trim()
+    };
+  });
   if (new Set(normalized.map(item => item.documentId)).size !== normalized.length ||
       normalized.some(item => !Number.isInteger(item.documentId) ||
         !['LOCAL_PROCUREMENT_ACCEPTED', 'REJECTED'].includes(item.decision) ||
