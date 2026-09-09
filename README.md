@@ -59,7 +59,7 @@ The frontend currently lives in `index.html`, and the API lives in `server/src/s
 ## Prototype storage
 
 - Vendors, tickets, workflow states, upload metadata, checksums, review history, and notifications: MySQL
-- Uploaded file contents: local, git-ignored `server/uploads/<vendor legal name>/originals` directory
+- Uploaded file contents: local, git-ignored `server/uploads/<vendor ID>-<vendor legal name>/originals` directory
 - Email delivery: represented by persistent MySQL notification records displayed in **Mail outbox**
 
 ## Demo backend and MySQL

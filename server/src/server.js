@@ -215,7 +215,8 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
     const checksum = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     await connection.beginTransaction();
     const [documents] = await connection.execute(
-      `SELECT d.id, d.ticket_id, d.status, d.document_name, v.legal_name
+      `SELECT d.id, d.ticket_id, d.status, d.document_name,
+              v.id AS vendor_id, v.legal_name
        FROM ticket_documents d
        JOIN onboarding_tickets t ON t.id = d.ticket_id
        JOIN vendors v ON v.id = t.vendor_id
@@ -235,7 +236,7 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
       [req.params.documentId]
     );
     const version = versions[0].next_version;
-    const vendorFolder = safeFolderName(documents[0].legal_name);
+    const vendorFolder = `${documents[0].vendor_id}-${safeFolderName(documents[0].legal_name)}`;
     const originalsFolder = path.join(uploadRoot, vendorFolder, 'originals');
     await fs.promises.mkdir(originalsFolder, { recursive: true });
     const extension = path.extname(req.file.originalname).toLowerCase();
