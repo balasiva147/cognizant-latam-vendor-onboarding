@@ -3,8 +3,8 @@ USE vendor_onboarding;
 CREATE TABLE IF NOT EXISTS document_translations (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   document_upload_id BIGINT UNSIGNED NOT NULL,
-  target_language VARCHAR(10) NOT NULL DEFAULT 'EN-US',
-  provider VARCHAR(30) NOT NULL DEFAULT 'DEEPL',
+  target_language VARCHAR(10) NOT NULL DEFAULT 'en',
+  provider VARCHAR(30) NOT NULL DEFAULT 'LIBRETRANSLATE',
   status ENUM('PENDING','PROCESSING','COMPLETED','FAILED') NOT NULL DEFAULT 'PENDING',
   provider_document_id VARCHAR(255) NULL,
   translated_file_name VARCHAR(255) NULL,

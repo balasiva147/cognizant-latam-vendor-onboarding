@@ -6,3 +6,4 @@ node_modules/
 *.log
 server/.env
 server/uploads/
+.venv-libretranslate/

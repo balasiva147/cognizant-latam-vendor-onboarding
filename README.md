@@ -7,9 +7,11 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 ## What the demo includes
 
 - Separate Procurement and Vendor login experiences
-- LATAM country and communication-language selection
-- English, Spanish, and Portuguese interface copy
+- LATAM country and vendor communication-language selection
+- English-only site interface; communication language does not translate the UI
+- Vendor legal name, owner/authorized-person name, email, and registered-address collection
 - Two supported documents: **RFC Tax Certificate** and **Proof of Address**
+- Country-specific document lists: some demo countries require one supported document and others expose both
 - Unselected document checkboxes by default
 - MySQL-backed vendors, tickets, workflow states, upload metadata, review history, and notifications
 - Local versioned file storage under a vendor-specific directory
@@ -17,12 +19,13 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 - A separate required rejection reason for every rejected document
 - A vendor correction view showing only rejected documents and their previous rejection reasons
 - Repeatable reject, resubmit, and approve cycles
-- Automatic DeepL translation to English after every requested document is approved
+- Automatic local LibreTranslate translation to English after every requested document is approved
+- Local extraction of text-based PDFs and generation of separate English review PDFs
 
 ## Technology and storage
 
 - Frontend: dependency-free HTML, CSS, and JavaScript in `index.html`
-- Backend: Node.js, Express, MySQL2, and Multer in `server/src/server.js`
+- Backend: Node.js, Express, MySQL2, Multer, pdf-parse, and PDFKit
 - Database: MySQL 8
 - Demo notifications: MySQL records displayed in the application's **Mail outbox**; no real email is sent
 - Uploaded originals: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/originals/`
@@ -38,7 +41,7 @@ Install:
 - Node.js 18 or later and npm
 - MySQL Server 8 and MySQL Workbench, or another MySQL client
 - Python 3 for the simple frontend web server
-- A DeepL API Developer or API Free key for automatic document translation
+- LibreTranslate running locally (Python installation or Docker)
 
 Check the command-line tools:
 
@@ -111,6 +114,8 @@ If the database was created using an older version of this repository, back it u
 
 1. `server/migrations/002_workflow_states.sql`
 2. `server/migrations/003_document_translations.sql`
+3. `server/migrations/004_libretranslate_defaults.sql`
+4. `server/migrations/005_vendor_authorized_person.sql`
 
 For a fresh database, run only `server/schema.sql`; it already includes all current tables.
 
@@ -141,18 +146,67 @@ DB_USER=vendor_app
 DB_PASSWORD=replace_with_your_local_password
 DB_NAME=vendor_onboarding
 MAX_UPLOAD_MB=10
-DEEPL_API_KEY=replace_with_your_deepl_api_key
-DEEPL_API_URL=https://api-free.deepl.com
-DEEPL_TARGET_LANGUAGE=EN-US
-DEEPL_POLL_INTERVAL_MS=1500
-DEEPL_POLL_TIMEOUT_MS=180000
+LIBRETRANSLATE_URL=http://127.0.0.1:5000
+LIBRETRANSLATE_TARGET_LANGUAGE=en
+LIBRETRANSLATE_CHUNK_CHARACTERS=4000
+LIBRETRANSLATE_TIMEOUT_MS=120000
+LIBRETRANSLATE_API_KEY=
 ```
 
 `DB_PASSWORD` must exactly match the password assigned to `vendor_app`. The `.env` file and `server/uploads` directory are ignored by Git.
 
-Use `https://api-free.deepl.com` for an API Free key ending in `:fx`. If DeepL identifies the account as API Developer and supplies a non-Free endpoint, set `DEEPL_API_URL=https://api.deepl.com`. Never put the API key in `index.html` or commit `server/.env`.
+The local LibreTranslate server does not require an API key by default, so leave `LIBRETRANSLATE_API_KEY` blank. Never put credentials in `index.html` or commit `server/.env`.
 
-## 4. Install dependencies and start the API
+## 4. Start LibreTranslate locally
+
+LibreTranslate is a separate local service. Keep it running while testing translations.
+
+### Option A: Python virtual environment on Windows
+
+Use Python 3.11 and a short installation path. A short path avoids Windows' legacy path-length limit when installing the machine-learning libraries:
+
+```powershell
+$ltInstallRoot = Join-Path $env:LOCALAPPDATA 'LibreTranslateDemo'
+py -3.11 -m venv "$ltInstallRoot\venv"
+& "$ltInstallRoot\venv\Scripts\python.exe" -m pip install --upgrade pip
+& "$ltInstallRoot\venv\Scripts\python.exe" -m pip install libretranslate
+$env:XDG_DATA_HOME = "$ltInstallRoot\data"
+$env:XDG_CONFIG_HOME = "$ltInstallRoot\config"
+$env:XDG_CACHE_HOME = "$ltInstallRoot\cache"
+& "$ltInstallRoot\venv\Scripts\libretranslate.exe" --load-only en,es,pt,pt-BR --host 127.0.0.1 --port 5000 --disable-web-ui --disable-files-translation
+```
+
+The first installation and first start can take several minutes because Python packages and translation models are downloaded. Later translations run locally. Keep this terminal open.
+
+If a corporate proxy permits `argos-net.com` but blocks the Argos model index, download and install the three official packages directly before starting LibreTranslate:
+
+```powershell
+$ltModelFolder = "$ltInstallRoot\models"
+New-Item -ItemType Directory -Force -Path $ltModelFolder | Out-Null
+Invoke-WebRequest 'https://argos-net.com/v1/translate-es_en-1_9.argosmodel' -OutFile "$ltModelFolder\translate-es_en-1_9.argosmodel"
+Invoke-WebRequest 'https://argos-net.com/v1/translate-pt_en-1_9.argosmodel' -OutFile "$ltModelFolder\translate-pt_en-1_9.argosmodel"
+Invoke-WebRequest 'https://argos-net.com/v1/translate-pb_en-1_9.argosmodel' -OutFile "$ltModelFolder\translate-pb_en-1_9.argosmodel"
+& "$ltInstallRoot\venv\Scripts\python.exe" -c "from argostranslate import package; import glob; [package.install_from_path(p) for p in glob.glob(r'$ltModelFolder\*.argosmodel')]; print('Models installed')"
+```
+
+### Option B: Docker Desktop
+
+If Docker Desktop is already installed and running:
+
+```powershell
+docker run --rm -it -p 5000:5000 libretranslate/libretranslate --load-only en,es,pt,pt-BR
+```
+
+Verify the local service in a new PowerShell window:
+
+```powershell
+$body = @{ q = 'Certificado fiscal'; source = 'es'; target = 'en'; format = 'text' } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:5000/translate -ContentType application/json -Body $body
+```
+
+The response should contain English text in `translatedText`. The backend explicitly uses Spanish for Spanish-language tickets and Brazilian Portuguese for Brazil/Portuguese tickets rather than relying only on automatic detection.
+
+## 5. Install dependencies and start the API
 
 Open terminal 1:
 
@@ -176,7 +230,7 @@ Open <http://127.0.0.1:3000/api/health>. A successful database connection return
 
 Keep terminal 1 running.
 
-## 5. Start the frontend
+## 6. Start the frontend
 
 Open terminal 2 at the repository root, not inside `server`:
 
@@ -209,12 +263,12 @@ Use small sample `.pdf`, `.png`, `.jpg`, `.jpeg`, `.doc`, or `.docx` files. The 
 ### A. Create a request as Procurement
 
 1. Sign in as Procurement.
-2. Select a LATAM country and communication language.
+2. Select a LATAM country and vendor communication language. Confirm the interface remains in English.
 3. Confirm **Onboard vendor** becomes available only after both selections are made.
 4. Select **Onboard vendor** and enter a unique vendor name, email, and address.
 5. Confirm only **RFC Tax Certificate** and **Proof of Address** are listed.
 6. Confirm neither document checkbox is selected by default.
-7. Select both documents and submit.
+7. Select the country-specific documents and choose **Send request**.
 
 Expected result:
 
@@ -290,10 +344,10 @@ Expected result:
 - The database ticket and document states are `LOCAL_PROCUREMENT_ACCEPTED`.
 - Two background translation records progress through `PENDING`, `PROCESSING`, and `COMPLETED`.
 - English files are written under `server/uploads/<vendor-id>-<sanitized-vendor-name>/translated/`.
-- Translated filenames contain `translated-en-us-vN` and can be retrieved through the translation download endpoint.
+- Translated filenames contain `translated-en-vN` and can be retrieved through the translation download endpoint.
 - Reopening the Procurement ticket shows the translation status and a **View English** button after completion.
 
-Translation runs after the approval transaction commits, so a temporary DeepL failure does not undo procurement approval. A failed provider request is recorded as `FAILED` with diagnostic text in `document_translations`.
+Translation runs after the approval transaction commits, so a temporary LibreTranslate failure does not undo procurement approval. A failed request is recorded as `FAILED` with diagnostic text in `document_translations`. The generated English PDF is a readable review copy; it does not reproduce the original form layout.
 
 ### G. Verify separate reasons for two rejected documents
 
@@ -355,6 +409,7 @@ Rejection is recorded as an event in `document_review_events`. The affected docu
 | `POST` | `/api/ticket-documents/<document-id>/upload` | Upload a requested document version |
 | `GET` | `/api/uploads/<upload-id>` | View an uploaded file |
 | `GET` | `/api/translations/<translation-id>` | View a completed English translation |
+| `POST` | `/api/tickets/<ticket-number>/translations/retry` | Retry failed translations for an approved ticket |
 | `POST` | `/api/tickets/<ticket-number>/review` | Submit one or more procurement decisions |
 | `GET` | `/api/notifications?email=<vendor-email>` | List notifications for one vendor |
 
@@ -393,13 +448,18 @@ Stop the existing process using port 3000 or 8765 before starting another server
 - Enter a separate non-empty reason for every rejected document.
 - Select **Submit review** to persist the decisions.
 
-### DeepL translation fails
+### Local translation fails
 
-- Confirm `DEEPL_API_KEY`, `DEEPL_API_URL`, and `DEEPL_TARGET_LANGUAGE` in `server/.env`.
-- Confirm the key has remaining document-translation allowance.
-- Check `document_translations.last_error` for the provider response.
-- Corporate proxies or web filters may block `api-free.deepl.com` as a Generative AI service. Use an approved network or request an organizational security exception; do not disable TLS verification.
-- Restart the API after changing DeepL configuration.
+- Confirm LibreTranslate is still running and open <http://127.0.0.1:5000/languages>.
+- Confirm `LIBRETRANSLATE_URL=http://127.0.0.1:5000` in `server/.env`.
+- Check `document_translations.last_error` for the exact failure.
+- The demo translation pipeline supports text-based PDF uploads. Image-only/scanned PDFs report that OCR is required.
+- Restart the Node.js API after changing environment configuration.
+- To reprocess an already failed approved ticket, replace the ticket number and run:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/api/tickets/LAT-2026-0000/translations/retry
+```
 
 ## Repository structure
 
@@ -413,7 +473,9 @@ Stop the existing process using port 3000 or 8765 before starting another server
     ├── schema.sql
     ├── migrations
     │   ├── 002_workflow_states.sql
-    │   └── 003_document_translations.sql
+    │   ├── 003_document_translations.sql
+    │   ├── 004_libretranslate_defaults.sql
+    │   └── 005_vendor_authorized_person.sql
     ├── src
     │   ├── server.js
     │   └── translation.js
@@ -430,7 +492,7 @@ Stop the existing process using port 3000 or 8765 before starting another server
 - Files are stored on the local machine rather than object storage.
 - File validation is limited to extension and size checks.
 - There is no malware scanning, encryption-at-rest integration, retention automation, or production authorization model.
-- RFC Tax Certificate is Mexico-specific; the same two-document list is intentionally used for every country in this focused demo.
+- Country document lists are simplified for the demo and are not a substitute for current local legal or tax requirements.
 
 ## Development
 

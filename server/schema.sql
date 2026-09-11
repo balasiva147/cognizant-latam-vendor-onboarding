@@ -7,6 +7,7 @@ USE vendor_onboarding;
 CREATE TABLE IF NOT EXISTS vendors (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   legal_name VARCHAR(200) NOT NULL,
+  authorized_person_name VARCHAR(200) NOT NULL,
   email VARCHAR(254) NOT NULL,
   registered_address VARCHAR(500) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -71,13 +72,13 @@ CREATE TABLE IF NOT EXISTS document_uploads (
     ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
--- DeepL translations are generated automatically after every document on a
--- ticket is approved. Originals and translated output remain separate.
+-- LibreTranslate translations are generated automatically after every document
+-- on a ticket is approved. Originals and translated output remain separate.
 CREATE TABLE IF NOT EXISTS document_translations (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   document_upload_id BIGINT UNSIGNED NOT NULL,
-  target_language VARCHAR(10) NOT NULL DEFAULT 'EN-US',
-  provider VARCHAR(30) NOT NULL DEFAULT 'DEEPL',
+  target_language VARCHAR(10) NOT NULL DEFAULT 'en',
+  provider VARCHAR(30) NOT NULL DEFAULT 'LIBRETRANSLATE',
   status ENUM('PENDING','PROCESSING','COMPLETED','FAILED') NOT NULL DEFAULT 'PENDING',
   provider_document_id VARCHAR(255) NULL,
   translated_file_name VARCHAR(255) NULL,

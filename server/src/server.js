@@ -27,6 +27,14 @@ const translationService = createTranslationService({ pool, uploadRoot });
 
 const allowedExtensions = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx']);
 const activeDocumentNames = new Set(['RFC Tax Certificate', 'Proof of Address']);
+const countryDocumentNames = new Map([
+  ['BR', new Set(['Proof of Address'])],
+  ['MX', new Set(['RFC Tax Certificate', 'Proof of Address'])],
+  ['CO', new Set(['Proof of Address'])],
+  ['AR', new Set(['RFC Tax Certificate', 'Proof of Address'])],
+  ['CL', new Set(['Proof of Address'])],
+  ['PE', new Set(['RFC Tax Certificate', 'Proof of Address'])]
+]);
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxUploadBytes, files: 1 },
@@ -80,20 +88,24 @@ app.get('/api/health', async (_req, res, next) => {
 });
 
 app.post('/api/tickets', async (req, res, next) => {
-  const { ticketNumber, vendorName, vendorEmail, address, countryCode, language, documents } = req.body;
-  if (![ticketNumber, vendorName, vendorEmail, address, countryCode, language].every(Boolean) || !Array.isArray(documents) || !documents.length) {
-    return res.status(400).json({ error: 'Ticket, vendor, country, language, and documents are required.' });
+  const { ticketNumber, vendorName, authorizedPersonName, vendorEmail, address, countryCode, language, documents } = req.body;
+  if (![ticketNumber, vendorName, authorizedPersonName, vendorEmail, address, countryCode, language].every(value => String(value || '').trim()) || !Array.isArray(documents) || !documents.length) {
+    return res.status(400).json({ error: 'Ticket, vendor legal name, owner or authorized person, email, address, country, language, and documents are required.' });
   }
   if (documents.some(documentName => !activeDocumentNames.has(documentName))) {
     return res.status(400).json({ error: 'Only RFC Tax Certificate and Proof of Address are available in this demo.' });
+  }
+  const countryDocuments = countryDocumentNames.get(String(countryCode).toUpperCase());
+  if (!countryDocuments || documents.some(documentName => !countryDocuments.has(documentName))) {
+    return res.status(400).json({ error: 'One or more documents are not configured for the selected country.' });
   }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
     const [vendorResult] = await connection.execute(
-      'INSERT INTO vendors (legal_name, email, registered_address) VALUES (?, ?, ?)',
-      [vendorName, vendorEmail, address]
+      'INSERT INTO vendors (legal_name, authorized_person_name, email, registered_address) VALUES (?, ?, ?, ?)',
+      [vendorName.trim(), authorizedPersonName.trim(), vendorEmail.trim(), address.trim()]
     );
     const [ticketResult] = await connection.execute(
       `INSERT INTO onboarding_tickets
@@ -131,7 +143,7 @@ app.get('/api/tickets', async (req, res, next) => {
     if (req.query.email) parameters.push(req.query.email);
     const [rows] = await pool.execute(
       `SELECT t.ticket_number, t.country_code, t.communication_language, t.status,
-              t.created_at, v.legal_name, v.email, v.registered_address,
+              t.created_at, v.legal_name, v.authorized_person_name, v.email, v.registered_address,
               d.id AS document_id, d.document_name, d.status AS document_status,
               d.rejection_reason,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
@@ -160,6 +172,7 @@ app.get('/api/tickets', async (req, res, next) => {
         tickets.set(row.ticket_number, {
           ticketNumber: row.ticket_number,
           vendorName: row.legal_name,
+          authorizedPersonName: row.authorized_person_name,
           vendorEmail: row.email,
           address: row.registered_address,
           countryCode: row.country_code,
@@ -198,7 +211,7 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(
       `SELECT t.id, t.ticket_number, t.country_code, t.communication_language, t.status,
-              v.legal_name, v.email, v.registered_address,
+              v.legal_name, v.authorized_person_name, v.email, v.registered_address,
               d.id AS document_id, d.document_name, d.status AS document_status,
               d.rejection_reason, (d.status = 'INIT') AS can_upload,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
@@ -327,6 +340,21 @@ app.get('/api/translations/:translationId', async (req, res, next) => {
     res.type(rows[0].mime_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(rows[0].translated_file_name)}`);
     res.sendFile(filePath);
+  } catch (error) { next(error); }
+});
+
+app.post('/api/tickets/:ticketNumber/translations/retry', async (req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id, status FROM onboarding_tickets WHERE ticket_number = ?',
+      [req.params.ticketNumber]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Ticket not found.' });
+    if (rows[0].status !== 'LOCAL_PROCUREMENT_ACCEPTED') {
+      return res.status(409).json({ error: 'Translations can start only after all documents are approved.' });
+    }
+    translationService.queueTicket(rows[0].id, true);
+    res.status(202).json({ ticketNumber: req.params.ticketNumber, translationQueued: true });
   } catch (error) { next(error); }
 });
 
