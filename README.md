@@ -6,7 +6,8 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 
 ## What the demo includes
 
-- Separate Procurement and Vendor login experiences
+- Supabase email/password login, email verification, registration, and password reset
+- Backend-enforced procurement and vendor access
 - LATAM country and vendor communication-language selection
 - English-only site interface; communication language does not translate the UI
 - Vendor legal name, owner/authorized-person name, email, and registered-address collection
@@ -27,7 +28,7 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 - Frontend: dependency-free HTML, CSS, and JavaScript in `index.html`
 - Backend: Node.js, Express, MySQL2, Multer, pdf-parse, and PDFKit
 - Database: MySQL 8
-- Demo notifications: MySQL records displayed in the application's **Mail outbox**; no real email is sent
+- Real Gmail SMTP notifications, with PENDING/SENT/FAILED status and manual retry in Mail outbox
 - Uploaded originals: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/originals/`
 - English translations: local, git-ignored `server/uploads/<vendor-id>-<sanitized-vendor-name>/translated/`
 
@@ -40,7 +41,7 @@ Install:
 - Git
 - Node.js 18 or later and npm
 - MySQL Server 8 and MySQL Workbench, or another MySQL client
-- Python 3 for the simple frontend web server
+- Node.js for the restricted frontend web server
 - LibreTranslate running locally (Python installation or Docker)
 
 Check the command-line tools:
@@ -246,15 +247,47 @@ py -m http.server 8765
 
 Open <http://127.0.0.1:8765>. Use this exact host and port because it matches `FRONTEND_ORIGIN` in the backend configuration.
 
-## Demo login details
+## Real login and email configuration
 
-| Role | Email | Password |
-| --- | --- | --- |
-| Procurement | `procurement@cognizant.com` | `demo123` |
-| Vendor | The vendor email entered when creating the ticket | `demo123` |
-| Vendor preview | `vendor@example.com` | `demo123` |
+Keep existing MySQL and LibreTranslate settings in `server/.env`, and add:
 
-Authentication is simulated in the browser. These are not production credentials.
+```dotenv
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_PUBLISHABLE_KEY=your_publishable_key
+PROCUREMENT_ADMIN_EMAIL=your_procurement@gmail.com
+APP_BASE_URL=http://127.0.0.1:8765/
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_SECURE=true
+SMTP_USER=your_sender@gmail.com
+SMTP_PASS=your_16_character_google_app_password
+SMTP_FROM="LATAM Vendor Onboarding Demo <your_sender@gmail.com>"
+```
+
+No Supabase secret/admin key is required by this implementation. Never commit credentials.
+Enable Email and Confirm email in Supabase. Set Site URL and allowed Redirect URL to
+`http://127.0.0.1:8765/`. Configure Gmail custom SMTP there too: Supabase sends confirmation
+and password-reset emails; the Node backend sends document requests and rejections.
+
+Register the designated procurement email using **Create account**, choose a new password,
+confirm the email, then sign in. No other email can self-assign procurement access.
+Vendors register using an email already present on a procurement-created ticket. The invitation
+prefills their email but grants no access itself: Supabase verification and login are required.
+Confirmation and reset links use Supabase's expiry and single-use verification behavior.
+Registration for an existing account does not overwrite its password; use **Forgot password?**.
+
+The backend verifies Supabase identity on requests and uses HttpOnly session cookies.
+Sessions expire after eight hours and are lost on backend restart. Use the exact same
+127.0.0.1 host for both services. Remote devices cannot use these localhost invitation links.
+Do not run Python's repository-wide file server: use `node start-frontend.js` to prevent
+access to private configuration and uploaded documents.
+
+No new MySQL migration is needed for authentication: Supabase stores account credentials,
+and vendor ownership is matched to the verified email. Existing vendors can register with
+their recorded email. Existing notification rows are not automatically mailed. Only new
+requests/rejections are sent, or procurement can explicitly retry a pending/failed email.
+SENT means the SMTP server accepted the message, not proof of inbox delivery.
+Failed/pending deliveries require manual retry, including after an interrupted backend.
 
 ## Verify the complete workflow
 
@@ -262,10 +295,10 @@ Use small sample `.pdf`, `.png`, `.jpg`, `.jpeg`, `.doc`, or `.docx` files. The 
 
 ### A. Create a request as Procurement
 
-1. Sign in as Procurement.
+1. Sign in with the verified procurement account.
 2. Select a LATAM country and vendor communication language. Confirm the interface remains in English.
 3. Confirm **Onboard vendor** becomes available only after both selections are made.
-4. Select **Onboard vendor** and enter a unique vendor name, email, and address.
+4. Select **Onboard vendor** and enter vendor legal name, owner/authorized person, email, and address.
 5. Confirm only **RFC Tax Certificate** and **Proof of Address** are listed.
 6. Confirm neither document checkbox is selected by default.
 7. Select the country-specific documents and choose **Send request**.
@@ -279,7 +312,7 @@ Expected result:
 ### B. Upload documents as the Vendor
 
 1. Sign out.
-2. Sign in as Vendor using the exact email entered on the ticket and password `demo123`.
+2. Open the actual request email, register with the invited address, confirm the verification email, then sign in with your chosen password.
 3. Open the ticket.
 4. Confirm both requested documents have upload controls.
 5. Choose one sample file for each document and select **Submit uploaded documents**.
@@ -319,7 +352,7 @@ Expected result:
 
 ### E. Verify the Vendor correction view
 
-1. Sign in as the same Vendor or open the vendor link from the latest Mail outbox notification.
+1. Sign in as the same Vendor or follow the link in the actual rejection email.
 2. Open the ticket.
 
 Expected result:
@@ -398,6 +431,12 @@ ORDER BY id DESC;
 Rejection is recorded as an event in `document_review_events`. The affected document returns to `INIT`, retains its rejection reason, and can receive a new immutable upload version. This cycle continues until every requested document is accepted.
 
 ## Useful API endpoints
+
+Except health and authentication entry points, all endpoints require a valid session cookie.
+POST requests also require the configured frontend Origin. Vendor list filters are enforced by
+verified identity; changing the email query parameter cannot expose other vendors.
+Procurement-only routes include ticket creation, review, translation retry, and email retry.
+
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
@@ -487,8 +526,8 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/api/tickets/LAT-2026-0
 
 ## Demo limitations
 
-- Login is simulated and is not secure authentication.
-- Notifications are stored and displayed in-app; no email provider is connected.
+- Sessions are in memory for a single local backend and end on restart.
+- Gmail and Supabase delivery limits apply. Use Mail outbox to retry failed notifications.
 - Files are stored on the local machine rather than object storage.
 - File validation is limited to extension and size checks.
 - There is no malware scanning, encryption-at-rest integration, retention automation, or production authorization model.

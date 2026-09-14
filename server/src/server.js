@@ -6,6 +6,8 @@ const cors = require('cors');
 const multer = require('multer');
 const mysql = require('mysql2/promise');
 const { createTranslationService } = require('./translation');
+const { createAuth } = require('./auth');
+const { createMail } = require('./mail');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const port = Number(process.env.PORT || 3000);
@@ -24,6 +26,8 @@ const pool = mysql.createPool({
   namedPlaceholders: true
 });
 const translationService = createTranslationService({ pool, uploadRoot });
+const auth = createAuth({ pool });
+const mail = createMail({ pool });
 
 const allowedExtensions = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx']);
 const activeDocumentNames = new Set(['RFC Tax Certificate', 'Proof of Address']);
@@ -77,13 +81,25 @@ async function renameRejectedUpload(connection, uploadRow) {
 }
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:8765' }));
+app.use(cors({ origin: new URL(process.env.APP_BASE_URL || process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:8765').origin, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
+app.use('/api', auth.guardOrigin);
+auth.routes(app);
 
 app.get('/api/health', async (_req, res, next) => {
   try {
     await pool.query('SELECT 1');
     res.json({ status: 'ok', database: 'connected' });
+  } catch (error) { next(error); }
+});
+
+app.use('/api', auth.requireUser, auth.authorize);
+app.post('/api/notifications/:notificationId/retry', async (req, res, next) => {
+  try {
+    const [rows] = await pool.execute('SELECT id FROM vendor_notifications WHERE id=?', [req.params.notificationId]);
+    if (!rows.length) return res.status(404).json({ error: 'Notification not found.' });
+    mail.queue(req.params.notificationId);
+    res.status(202).json({ message: 'Email delivery queued.' });
   } catch (error) { next(error); }
 });
 
@@ -119,7 +135,7 @@ app.post('/api/tickets', async (req, res, next) => {
         [ticketResult.insertId, documentName]
       );
     }
-    await connection.execute(
+    const [notification] = await connection.execute(
       `INSERT INTO vendor_notifications
        (ticket_id, vendor_id, notification_type, subject, message, rejected_documents)
        VALUES (?, ?, 'DOCUMENTS_REQUESTED', ?, ?, ?)`,
@@ -129,6 +145,7 @@ app.post('/api/tickets', async (req, res, next) => {
         JSON.stringify(documents.map(documentName => ({ documentName })))]
     );
     await connection.commit();
+    mail.queue(notification.insertId);
     res.status(201).json({ id: ticketResult.insertId, ticketNumber });
   } catch (error) {
     await connection.rollback();
@@ -139,8 +156,9 @@ app.post('/api/tickets', async (req, res, next) => {
 app.get('/api/tickets', async (req, res, next) => {
   try {
     const parameters = [];
-    const emailFilter = req.query.email ? 'WHERE v.email = ?' : '';
-    if (req.query.email) parameters.push(req.query.email);
+    const email = req.vendorEmail || req.query.email;
+    const emailFilter = email ? 'WHERE LOWER(v.email) = LOWER(?)' : '';
+    if (email) parameters.push(email);
     const [rows] = await pool.execute(
       `SELECT t.ticket_number, t.country_code, t.communication_language, t.status,
               t.created_at, v.legal_name, v.authorized_person_name, v.email, v.registered_address,
@@ -241,7 +259,7 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
 
 app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), async (req, res, next) => {
   if (!req.file) return res.status(400).json({ error: 'A document file is required.' });
-  const uploadedByEmail = req.body.uploadedByEmail;
+  const uploadedByEmail = req.user.email;
   if (!uploadedByEmail) return res.status(400).json({ error: 'uploadedByEmail is required.' });
 
   const connection = await pool.getConnection();
@@ -321,7 +339,10 @@ app.get('/api/uploads/:uploadId', async (req, res, next) => {
     if (!rows.length) return res.status(404).json({ error: 'Upload not found.' });
     const filePath = path.resolve(uploadRoot, rows[0].storage_path);
     if (!filePath.startsWith(`${uploadRoot}${path.sep}`)) return res.status(400).json({ error: 'Invalid storage path.' });
-    res.type(rows[0].mime_type);
+    const safeTypes = { '.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg' };
+    res.type(safeTypes[path.extname(rows[0].original_file_name).toLowerCase()] || 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "sandbox");
     res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(rows[0].original_file_name)}`);
     res.sendFile(filePath);
   } catch (error) { next(error); }
@@ -359,86 +380,7 @@ app.post('/api/tickets/:ticketNumber/translations/retry', async (req, res, next)
 });
 
 app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
-  const { note, reviewedByEmail } = req.body;
-  const decision = req.body.decision === 'APPROVED'
-    ? 'LOCAL_PROCUREMENT_ACCEPTED' : req.body.decision;
-  if (!['LOCAL_PROCUREMENT_ACCEPTED', 'REJECTED'].includes(decision) || !reviewedByEmail || (decision === 'REJECTED' && !note)) {
-    return res.status(400).json({ error: 'A valid decision, reviewer, and rejection note when rejected are required.' });
-  }
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const [uploads] = await connection.execute(
-      `SELECT u.id, u.storage_path, u.stored_file_name, u.version_number FROM document_uploads u
-       JOIN ticket_documents d ON d.id = u.ticket_document_id
-       WHERE u.ticket_document_id = ? AND d.status = 'DOCUMENTS_UPLOADED'
-       ORDER BY u.version_number DESC LIMIT 1`,
-      [req.params.documentId]
-    );
-    if (!uploads.length) {
-      await connection.rollback();
-      return res.status(409).json({ error: 'No unreviewed upload is available.' });
-    }
-    if (decision === 'REJECTED') await renameRejectedUpload(connection, uploads[0]);
-    await connection.execute(
-      `UPDATE ticket_documents SET status = ?, rejection_reason = ? WHERE id = ?`,
-      [decision === 'REJECTED' ? 'INIT' : 'LOCAL_PROCUREMENT_ACCEPTED', decision === 'REJECTED' ? note : null, req.params.documentId]
-    );
-    await connection.execute(
-      `INSERT INTO document_review_events
-       (ticket_document_id, document_upload_id, decision, review_note, reviewed_by_email)
-       VALUES (?, ?, ?, ?, ?)`,
-      [req.params.documentId, uploads[0].id, decision, note || null, reviewedByEmail]
-    );
-    const [ticketRows] = await connection.execute(
-      `SELECT t.id, t.ticket_number, t.vendor_id FROM onboarding_tickets t
-       JOIN ticket_documents d ON d.ticket_id = t.id WHERE d.id = ?`,
-      [req.params.documentId]
-    );
-    const ticketId = ticketRows[0].id;
-    const [counts] = await connection.execute(
-      `SELECT COUNT(*) total,
-              SUM(status = 'LOCAL_PROCUREMENT_ACCEPTED') accepted,
-              SUM(status = 'INIT') init_count
-       FROM ticket_documents WHERE ticket_id = ?`,
-      [ticketId]
-    );
-    const nextStatus = Number(counts[0].accepted) === Number(counts[0].total)
-      ? 'LOCAL_PROCUREMENT_ACCEPTED'
-      : Number(counts[0].init_count) > 0 ? 'INIT' : 'DOCUMENTS_UPLOADED';
-    await connection.execute('UPDATE onboarding_tickets SET status = ? WHERE id = ?', [nextStatus, ticketId]);
-    if (decision === 'REJECTED') {
-      const [documentRows] = await connection.execute(
-        'SELECT document_name FROM ticket_documents WHERE id = ?',
-        [req.params.documentId]
-      );
-      const rejectedDocuments = [{
-        documentId: Number(req.params.documentId),
-        documentName: documentRows[0].document_name,
-        rejectionText: note
-      }];
-      await connection.execute(
-        `INSERT INTO vendor_notifications
-         (ticket_id, vendor_id, notification_type, subject, message, rejected_documents)
-         VALUES (?, ?, 'DOCUMENTS_REJECTED', ?, ?, ?)`,
-        [ticketId, ticketRows[0].vendor_id,
-          `Documents rejected for ${ticketRows[0].ticket_number}`,
-          'Local Procurement requested corrected documents. Sign in to review the comments and upload new versions.',
-          JSON.stringify(rejectedDocuments)]
-      );
-    }
-    await connection.commit();
-    if (nextStatus === 'LOCAL_PROCUREMENT_ACCEPTED') translationService.queueTicket(ticketId);
-    res.json({
-      documentId: Number(req.params.documentId),
-      decision,
-      ticketStatus: nextStatus,
-      translationQueued: nextStatus === 'LOCAL_PROCUREMENT_ACCEPTED'
-    });
-  } catch (error) {
-    await connection.rollback();
-    next(error);
-  } finally { connection.release(); }
+  return res.status(410).json({ error: 'Use Submit review on the ticket to save decisions together.' });
 });
 
 app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
@@ -562,6 +504,7 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
 
     await connection.commit();
     if (ticketStatus === 'LOCAL_PROCUREMENT_ACCEPTED') translationService.queueTicket(ticket.id);
+    mail.queue(notificationId);
     res.json({
       ticketNumber: ticket.ticket_number,
       ticketStatus,
@@ -578,8 +521,9 @@ app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
 app.get('/api/notifications', async (req, res, next) => {
   try {
     const parameters = [];
-    const emailFilter = req.query.email ? 'WHERE v.email = ?' : '';
-    if (req.query.email) parameters.push(req.query.email);
+    const email = req.vendorEmail || req.query.email;
+    const emailFilter = email ? 'WHERE LOWER(v.email) = LOWER(?)' : '';
+    if (email) parameters.push(email);
     const [rows] = await pool.execute(
       `SELECT n.id, t.ticket_number, n.notification_type, n.subject, n.message,
               n.rejected_documents, n.delivery_status, n.created_at, n.sent_at, n.read_at,
@@ -612,11 +556,11 @@ app.get('/api/vendors/:email/notifications', async (req, res, next) => {
 });
 
 app.use((error, _req, res, _next) => {
-  console.error(error);
+  console.error('Request failed:', error.code || error.name);
   if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: `File exceeds the ${process.env.MAX_UPLOAD_MB || 15} MB demo limit.` });
   }
-  res.status(500).json({ error: error.message || 'Unexpected server error.' });
+  res.status(500).json({ error: 'Request failed. Check backend configuration and database availability.' });
 });
 
-app.listen(port, () => console.log(`Vendor onboarding API listening on http://127.0.0.1:${port}`));
+app.listen(port, '127.0.0.1', () => console.log(`Vendor onboarding API listening on http://127.0.0.1:${port}`));
