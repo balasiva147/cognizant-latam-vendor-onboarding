@@ -28,7 +28,22 @@ function createMail({ pool, env = process.env, transportFactory = nodemailer.cre
       console.error('Email delivery failed for notification', id, '(check SMTP settings and network connectivity).');
     } finally { active.delete(String(id)); }
   }
+  async function deliverTeam({ to, subject, message }) {
+    if (!to) throw new Error('Team notification recipient is not configured.');
+    if (!transport) throw new Error('SMTP is not configured');
+    const url = new URL(env.APP_BASE_URL || 'http://127.0.0.1:8765/');
+    await transport.sendMail({
+      from: env.SMTP_FROM || env.SMTP_USER,
+      to,
+      subject,
+      text: `${message}\n\nSign in to review the request:\n${url.href}`
+    });
+  }
   function queue(id) { if (id) deliver(id).catch(() => console.error('Unable to persist notification delivery status')); }
-  return { queue, deliver, transport };
+  function queueTeam(notification) {
+    if (!notification?.to) return;
+    setImmediate(() => deliverTeam(notification).catch(() => console.error('Team email delivery failed for', notification.to, '(check SMTP settings and network connectivity).')));
+  }
+  return { queue, deliver, queueTeam, deliverTeam, transport };
 }
 module.exports = { createMail };

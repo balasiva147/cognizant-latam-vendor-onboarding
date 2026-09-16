@@ -72,6 +72,19 @@ test('email includes each rejection reason and marks SMTP acceptance as SENT', a
   assert.match(updated, /delivery_status='SENT'/);
 });
 
+test('team email directs Local SOA to the application', async () => {
+  let sent;
+  const mail = createMail({
+    env: { SMTP_USER: 'sender@example.test', SMTP_PASS: 'test', APP_BASE_URL: 'http://127.0.0.1:8765/' },
+    transportFactory: () => ({ sendMail: async message => { sent = message; } }),
+    pool: {}
+  });
+  await mail.deliverTeam({ to: 'local-soa@example.test', subject: 'Documents ready', message: 'Review ticket T-1.' });
+  assert.equal(sent.to, 'local-soa@example.test');
+  assert.match(sent.text, /Review ticket T-1/);
+  assert.match(sent.text, /http:\/\/127\.0\.0\.1:8765\//);
+});
+
 test('frontend server never serves repository secrets, uploads, or traversal paths', async t => {
   const server = http.createServer(handler).listen(0, '127.0.0.1');
   await new Promise(resolve => server.once('listening', resolve));

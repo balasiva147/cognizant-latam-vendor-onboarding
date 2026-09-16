@@ -2,7 +2,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const files = new Map([['/', 'index.html'], ['/index.html', 'index.html'], ['/auth-ui.js', 'auth-ui.js']]);
+const files = new Map([['/', 'index.html'], ['/index.html', 'index.html'], ['/auth-ui.js', 'auth-ui.js'], ['/workflow-ui.js', 'workflow-ui.js']]);
 function handler(req, res) {
   const file = files.get(new URL(req.url, 'http://127.0.0.1').pathname);
   if (!file || !['GET', 'HEAD'].includes(req.method)) { res.writeHead(404); res.end('Not found'); return; }

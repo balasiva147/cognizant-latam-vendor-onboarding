@@ -8,6 +8,7 @@ const mysql = require('mysql2/promise');
 const { createTranslationService } = require('./translation');
 const { createAuth } = require('./auth');
 const { createMail } = require('./mail');
+const { createWorkflow } = require('./workflow');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const port = Number(process.env.PORT || 3000);
@@ -25,9 +26,9 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   namedPlaceholders: true
 });
-const translationService = createTranslationService({ pool, uploadRoot });
-const auth = createAuth({ pool });
 const mail = createMail({ pool });
+const translationService = createTranslationService({ pool, uploadRoot, mail });
+const auth = createAuth({ pool });
 
 const allowedExtensions = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.doc', '.docx']);
 const activeDocumentNames = new Set(['RFC Tax Certificate', 'Proof of Address']);
@@ -141,7 +142,7 @@ app.post('/api/tickets', async (req, res, next) => {
        VALUES (?, ?, 'DOCUMENTS_REQUESTED', ?, ?, ?)`,
       [ticketResult.insertId, vendorResult.insertId,
         `Documents requested for ${ticketNumber}`,
-        `Cognizant Local Procurement requested ${documents.length} documents. Sign in to upload them.`,
+        `Cognizant Indian SOA requested ${documents.length} documents. Sign in to upload them.`,
         JSON.stringify(documents.map(documentName => ({ documentName })))]
     );
     await connection.commit();
@@ -160,10 +161,10 @@ app.get('/api/tickets', async (req, res, next) => {
     const emailFilter = email ? 'WHERE LOWER(v.email) = LOWER(?)' : '';
     if (email) parameters.push(email);
     const [rows] = await pool.execute(
-      `SELECT t.ticket_number, t.country_code, t.communication_language, t.status,
+      `SELECT t.ticket_number, t.country_code, t.communication_language, t.status, t.workflow_stage,
               t.created_at, v.legal_name, v.authorized_person_name, v.email, v.registered_address,
               d.id AS document_id, d.document_name, d.status AS document_status,
-              d.rejection_reason,
+              d.india_status, d.security_status, d.rejection_reason,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
               u.size_bytes, u.version_number, u.uploaded_at,
               tr.id AS translation_id, tr.status AS translation_status,
@@ -180,6 +181,7 @@ app.get('/api/tickets', async (req, res, next) => {
        )
        LEFT JOIN document_translations tr
          ON tr.document_upload_id = u.id AND tr.target_language = ?
+        AND d.status = 'LOCAL_PROCUREMENT_ACCEPTED'
        ${emailFilter}
        ORDER BY t.created_at DESC, d.id`,
       [translationService.targetLanguage, ...parameters]
@@ -196,6 +198,7 @@ app.get('/api/tickets', async (req, res, next) => {
           countryCode: row.country_code,
           language: row.communication_language,
           status: row.status,
+          workflowStage: row.workflow_stage,
           createdAt: row.created_at,
           documents: []
         });
@@ -204,6 +207,7 @@ app.get('/api/tickets', async (req, res, next) => {
         id: Number(row.document_id),
         name: row.document_name,
         status: row.document_status,
+        indiaStatus: row.india_status, securityStatus: row.security_status,
         rejectionReason: row.rejection_reason,
         latestUploadId: row.latest_upload_id ? Number(row.latest_upload_id) : null,
         fileName: row.original_file_name,
@@ -221,6 +225,8 @@ app.get('/api/tickets', async (req, res, next) => {
         } : null
       });
     }
+    const [events] = await pool.execute(`SELECT e.*, t.ticket_number FROM workflow_events e JOIN onboarding_tickets t ON t.id=e.ticket_id JOIN vendors v ON v.id=t.vendor_id ${emailFilter} ORDER BY e.id`, parameters);
+    for (const ticket of tickets.values()) ticket.history = events.filter(e => e.ticket_number === ticket.ticketNumber);
     res.json([...tickets.values()]);
   } catch (error) { next(error); }
 });
@@ -228,10 +234,10 @@ app.get('/api/tickets', async (req, res, next) => {
 app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(
-      `SELECT t.id, t.ticket_number, t.country_code, t.communication_language, t.status,
+      `SELECT t.id, t.ticket_number, t.country_code, t.communication_language, t.status, t.workflow_stage,
               v.legal_name, v.authorized_person_name, v.email, v.registered_address,
               d.id AS document_id, d.document_name, d.status AS document_status,
-              d.rejection_reason, (d.status = 'INIT') AS can_upload,
+              d.india_status, d.security_status, d.rejection_reason, (d.status = 'INIT') AS can_upload,
               u.id AS latest_upload_id, u.original_file_name, u.mime_type,
               u.size_bytes, u.version_number, u.uploaded_at,
               tr.id AS translation_id, tr.status AS translation_status,
@@ -248,6 +254,7 @@ app.get('/api/tickets/:ticketNumber', async (req, res, next) => {
        )
        LEFT JOIN document_translations tr
          ON tr.document_upload_id = u.id AND tr.target_language = ?
+        AND d.status = 'LOCAL_PROCUREMENT_ACCEPTED'
        WHERE t.ticket_number = ?
        ORDER BY d.id`,
       [translationService.targetLanguage, req.params.ticketNumber]
@@ -267,6 +274,8 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
   try {
     const checksum = crypto.createHash('sha256').update(req.file.buffer).digest('hex');
     await connection.beginTransaction();
+    const [locks] = await connection.execute('SELECT t.id,t.ticket_number,t.workflow_stage FROM onboarding_tickets t JOIN ticket_documents d ON d.ticket_id=t.id WHERE d.id=? FOR UPDATE', [req.params.documentId]);
+    if (!locks.length || locks[0].workflow_stage !== 'VENDOR') { await connection.rollback(); return res.status(409).json({ error: 'This request is not currently awaiting a vendor upload.' }); }
     const [documents] = await connection.execute(
       `SELECT d.id, d.ticket_id, d.status, d.document_name,
               v.id AS vendor_id, v.legal_name
@@ -320,8 +329,19 @@ app.post('/api/ticket-documents/:documentId/upload', upload.single('document'), 
     );
     const ticketStatus = Number(counts[0].ready) === Number(counts[0].total)
       ? 'DOCUMENTS_UPLOADED' : 'INIT';
-    await connection.execute('UPDATE onboarding_tickets SET status = ? WHERE id = ?', [ticketStatus, ticketId]);
+    await connection.execute('UPDATE onboarding_tickets SET status = ?,workflow_stage=? WHERE id = ?', [ticketStatus, ticketStatus === 'DOCUMENTS_UPLOADED' ? 'LOCAL' : 'VENDOR', ticketId]);
+    await connection.execute("INSERT INTO workflow_events (ticket_id,stage,action,actor_email,details) VALUES (?,'VENDOR','DOCUMENT_UPLOADED',?,?)", [ticketId, uploadedByEmail, JSON.stringify({ documentId: Number(req.params.documentId), version })]);
+    if (ticketStatus === 'DOCUMENTS_UPLOADED') {
+      await connection.execute("INSERT INTO workflow_events (ticket_id,stage,action,actor_email,details) VALUES (?,'VENDOR','LOCAL_SOA_NOTIFIED','system',?)", [ticketId, JSON.stringify({ recipient: process.env.PROCUREMENT_ADMIN_EMAIL || null })]);
+    }
     await connection.commit();
+    if (ticketStatus === 'DOCUMENTS_UPLOADED') {
+      mail.queueTeam({
+        to: process.env.PROCUREMENT_ADMIN_EMAIL,
+        subject: `Documents ready for Local SOA review — ${locks[0].ticket_number}`,
+        message: `The vendor uploaded all currently requested documents for ${locks[0].ticket_number}. The request is ready for Local SOA review.`
+      });
+    }
     res.status(201).json({ uploadId: result.insertId, version, sha256: checksum, ticketStatus });
   } catch (error) {
     await connection.rollback();
@@ -351,8 +371,15 @@ app.get('/api/uploads/:uploadId', async (req, res, next) => {
 app.get('/api/translations/:translationId', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(
-      `SELECT translated_file_name, storage_path, mime_type
-       FROM document_translations WHERE id = ? AND status = 'COMPLETED'`,
+      `SELECT tr.translated_file_name, tr.storage_path, tr.mime_type
+       FROM document_translations tr
+       JOIN document_uploads u ON u.id=tr.document_upload_id
+       JOIN ticket_documents d ON d.id=u.ticket_document_id
+       WHERE tr.id = ? AND tr.status = 'COMPLETED'
+         AND d.status = 'LOCAL_PROCUREMENT_ACCEPTED'
+         AND u.id=(SELECT latest.id FROM document_uploads latest
+                   WHERE latest.ticket_document_id=d.id
+                   ORDER BY latest.version_number DESC LIMIT 1)`,
       [req.params.translationId]
     );
     if (!rows.length) return res.status(404).json({ error: 'Completed translation not found.' });
@@ -367,11 +394,11 @@ app.get('/api/translations/:translationId', async (req, res, next) => {
 app.post('/api/tickets/:ticketNumber/translations/retry', async (req, res, next) => {
   try {
     const [rows] = await pool.execute(
-      'SELECT id, status FROM onboarding_tickets WHERE ticket_number = ?',
+      'SELECT id, status,workflow_stage FROM onboarding_tickets WHERE ticket_number = ?',
       [req.params.ticketNumber]
     );
     if (!rows.length) return res.status(404).json({ error: 'Ticket not found.' });
-    if (rows[0].status !== 'LOCAL_PROCUREMENT_ACCEPTED') {
+    if (rows[0].workflow_stage !== 'TRANSLATION') {
       return res.status(409).json({ error: 'Translations can start only after all documents are approved.' });
     }
     translationService.queueTicket(rows[0].id, true);
@@ -383,140 +410,7 @@ app.post('/api/ticket-documents/:documentId/review', async (req, res, next) => {
   return res.status(410).json({ error: 'Use Submit review on the ticket to save decisions together.' });
 });
 
-app.post('/api/tickets/:ticketNumber/review', async (req, res, next) => {
-  const { decisions, reviewedByEmail } = req.body;
-  if (!reviewedByEmail || !Array.isArray(decisions) || !decisions.length) {
-    return res.status(400).json({ error: 'Reviewer and at least one document decision are required.' });
-  }
-  const normalized = decisions.map(item => {
-    const submittedDecision = String(item.decision || '').trim().toUpperCase();
-    return {
-      documentId: Number(item.documentId),
-      decision: submittedDecision === 'APPROVED'
-        ? 'LOCAL_PROCUREMENT_ACCEPTED' : submittedDecision,
-      note: String(item.note || '').trim()
-    };
-  });
-  if (new Set(normalized.map(item => item.documentId)).size !== normalized.length ||
-      normalized.some(item => !Number.isInteger(item.documentId) ||
-        !['LOCAL_PROCUREMENT_ACCEPTED', 'REJECTED'].includes(item.decision) ||
-        (item.decision === 'REJECTED' && !item.note))) {
-    return res.status(400).json({ error: 'Each document needs one valid decision and rejected documents need text.' });
-  }
-
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const [tickets] = await connection.execute(
-      `SELECT id, vendor_id, ticket_number FROM onboarding_tickets
-       WHERE ticket_number = ? FOR UPDATE`,
-      [req.params.ticketNumber]
-    );
-    if (!tickets.length) {
-      await connection.rollback();
-      return res.status(404).json({ error: 'Ticket not found.' });
-    }
-    const ticket = tickets[0];
-    const [documents] = await connection.execute(
-      `SELECT d.id, d.document_name, d.status,
-              u.id AS latest_upload_id, u.storage_path AS latest_storage_path,
-              u.stored_file_name AS latest_stored_file_name,
-              u.version_number AS latest_version_number
-       FROM ticket_documents d
-       LEFT JOIN document_uploads u ON u.id = (
-         SELECT du.id FROM document_uploads du
-         WHERE du.ticket_document_id = d.id
-         ORDER BY du.version_number DESC LIMIT 1
-       )
-       WHERE d.ticket_id = ? FOR UPDATE`,
-      [ticket.id]
-    );
-    const byId = new Map(documents.map(document => [Number(document.id), document]));
-    const rejectedDocuments = [];
-
-    for (const item of normalized) {
-      const document = byId.get(item.documentId);
-      if (!document) {
-        await connection.rollback();
-        return res.status(400).json({ error: `Document ${item.documentId} does not belong to this ticket.` });
-      }
-      if (document.status !== 'DOCUMENTS_UPLOADED' || !document.latest_upload_id) {
-        await connection.rollback();
-        return res.status(409).json({ error: `${document.document_name} has no unreviewed upload.` });
-      }
-      if (item.decision === 'REJECTED') {
-        await renameRejectedUpload(connection, {
-          id: document.latest_upload_id,
-          storage_path: document.latest_storage_path,
-          stored_file_name: document.latest_stored_file_name,
-          version_number: document.latest_version_number
-        });
-      }
-      const documentStatus = item.decision === 'REJECTED' ? 'INIT' : 'LOCAL_PROCUREMENT_ACCEPTED';
-      await connection.execute(
-        'UPDATE ticket_documents SET status = ?, rejection_reason = ? WHERE id = ?',
-        [documentStatus, item.decision === 'REJECTED' ? item.note : null, item.documentId]
-      );
-      await connection.execute(
-        `INSERT INTO document_review_events
-         (ticket_document_id, document_upload_id, decision, review_note, reviewed_by_email)
-         VALUES (?, ?, ?, ?, ?)`,
-        [item.documentId, document.latest_upload_id, item.decision, item.note || null, reviewedByEmail]
-      );
-      if (item.decision === 'REJECTED') {
-        rejectedDocuments.push({
-          documentId: item.documentId,
-          documentName: document.document_name,
-          rejectionText: item.note
-        });
-      }
-    }
-
-    const [counts] = await connection.execute(
-      `SELECT COUNT(*) total,
-              SUM(status = 'LOCAL_PROCUREMENT_ACCEPTED') accepted,
-              SUM(status = 'INIT') init_count
-       FROM ticket_documents WHERE ticket_id = ?`,
-      [ticket.id]
-    );
-    const ticketStatus = Number(counts[0].accepted) === Number(counts[0].total)
-      ? 'LOCAL_PROCUREMENT_ACCEPTED'
-      : Number(counts[0].init_count) > 0 ? 'INIT' : 'DOCUMENTS_UPLOADED';
-    await connection.execute(
-      'UPDATE onboarding_tickets SET status = ? WHERE id = ?',
-      [ticketStatus, ticket.id]
-    );
-
-    let notificationId = null;
-    if (rejectedDocuments.length) {
-      const names = rejectedDocuments.map(document => document.documentName).join(', ');
-      const [notification] = await connection.execute(
-        `INSERT INTO vendor_notifications
-         (ticket_id, vendor_id, notification_type, subject, message, rejected_documents)
-         VALUES (?, ?, 'DOCUMENTS_REJECTED', ?, ?, ?)`,
-        [ticket.id, ticket.vendor_id,
-          `Documents rejected for ${ticket.ticket_number}`,
-          `Local Procurement rejected: ${names}. Sign in to view comments and upload corrected versions.`,
-          JSON.stringify(rejectedDocuments)]
-      );
-      notificationId = notification.insertId;
-    }
-
-    await connection.commit();
-    if (ticketStatus === 'LOCAL_PROCUREMENT_ACCEPTED') translationService.queueTicket(ticket.id);
-    mail.queue(notificationId);
-    res.json({
-      ticketNumber: ticket.ticket_number,
-      ticketStatus,
-      rejectedDocuments,
-      notificationId,
-      translationQueued: ticketStatus === 'LOCAL_PROCUREMENT_ACCEPTED'
-    });
-  } catch (error) {
-    await connection.rollback();
-    next(error);
-  } finally { connection.release(); }
-});
+createWorkflow({ pool, mail, translationService, renameRejectedUpload }).routes(app);
 
 app.get('/api/notifications', async (req, res, next) => {
   try {
@@ -563,4 +457,5 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: 'Request failed. Check backend configuration and database availability.' });
 });
 
+translationService.resume().catch(error => console.error('Workflow recovery requires migration 006:', error.code || error.name));
 app.listen(port, '127.0.0.1', () => console.log(`Vendor onboarding API listening on http://127.0.0.1:${port}`));

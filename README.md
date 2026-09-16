@@ -7,7 +7,7 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 ## What the demo includes
 
 - Supabase email/password login, email verification, registration, and password reset
-- Backend-enforced procurement and vendor access
+- Backend-enforced Local SOA, Indian SOA, Corporate Security, and vendor access
 - LATAM country and vendor communication-language selection
 - English-only site interface; communication language does not translate the UI
 - Vendor legal name, owner/authorized-person name, email, and registered-address collection
@@ -18,14 +18,18 @@ A local demonstration of a multilingual vendor-onboarding workflow for Cognizant
 - Local versioned file storage under a vendor-specific directory
 - Batched procurement decisions saved only after **Submit review** is selected
 - A separate required rejection reason for every rejected document
-- A vendor correction view showing only rejected documents and their previous rejection reasons
+- A vendor view showing only pending requested/rejected documents and correction reasons; internal workflow and review history are not shown to vendors
 - Repeatable reject, resubmit, and approve cycles
 - Automatic local LibreTranslate translation to English after every requested document is approved
 - Local extraction of text-based PDFs and generation of separate English review PDFs
+- Indian SOA review after all latest translations complete, followed by Corporate Security
+- Indian SOA owns vendor document requests; every human workflow handoff sends an email to the next responsible party
+- Indian SOA and Corporate Security rejections go directly to the vendor with separate reasons
+- Per-request flow dashboard with green completed steps, current stage, and upload/review history
 
 ## Technology and storage
 
-- Frontend: dependency-free HTML, CSS, and JavaScript in `index.html`
+- Frontend: dependency-free `index.html`, `auth-ui.js`, and `workflow-ui.js`
 - Backend: Node.js, Express, MySQL2, Multer, pdf-parse, and PDFKit
 - Database: MySQL 8
 - Real Gmail SMTP notifications, with PENDING/SENT/FAILED status and manual retry in Mail outbox
@@ -108,6 +112,7 @@ Expected tables:
 - `document_review_events`
 - `vendor_notifications`
 - `document_translations`
+- `workflow_events`
 
 ### Existing demo database
 
@@ -117,6 +122,7 @@ If the database was created using an older version of this repository, back it u
 2. `server/migrations/003_document_translations.sql`
 3. `server/migrations/004_libretranslate_defaults.sql`
 4. `server/migrations/005_vendor_authorized_person.sql`
+5. `server/migrations/006_downstream_reviews.sql` (run once as root; preserves existing requests)
 
 For a fresh database, run only `server/schema.sql`; it already includes all current tables.
 
@@ -285,7 +291,7 @@ access to private configuration and uploaded documents.
 No new MySQL migration is needed for authentication: Supabase stores account credentials,
 and vendor ownership is matched to the verified email. Existing vendors can register with
 their recorded email. Existing notification rows are not automatically mailed. Only new
-requests/rejections are sent, or procurement can explicitly retry a pending/failed email.
+requests/rejections are sent, or Indian SOA can explicitly retry a pending/failed vendor email.
 SENT means the SMTP server accepted the message, not proof of inbox delivery.
 Failed/pending deliveries require manual retry, including after an interrupted backend.
 
@@ -293,9 +299,9 @@ Failed/pending deliveries require manual retry, including after an interrupted b
 
 Use small sample `.pdf`, `.png`, `.jpg`, `.jpeg`, `.doc`, or `.docx` files. The default maximum size is 15 MB per file.
 
-### A. Create a request as Procurement
+### A. Create a request as Indian SOA
 
-1. Sign in with the verified procurement account.
+1. Sign in with the verified Indian SOA account.
 2. Select a LATAM country and vendor communication language. Confirm the interface remains in English.
 3. Confirm **Onboard vendor** becomes available only after both selections are made.
 4. Select **Onboard vendor** and enter vendor legal name, owner/authorized person, email, and address.
@@ -321,12 +327,13 @@ Expected result:
 
 - Both documents show as uploaded.
 - The ticket reaches **Under review** (`DOCUMENTS_UPLOADED` in MySQL).
+- Local SOA receives an email that the request is ready for review.
 - Files are created in `server/uploads/<vendor-id>-<sanitized-vendor-name>/originals/`.
 - Initial filenames contain `-v1-`.
 
 ### C. Verify review choices are staged
 
-1. Sign in as Procurement and open the ticket.
+1. Sign in as Local SOA and open the ticket.
 2. Confirm both review checkboxes are initially unselected.
 3. Select both documents.
 4. Choose **Approve** for RFC Tax Certificate.
@@ -366,25 +373,25 @@ Upload a corrected Proof of Address and submit it. The new stored filename shoul
 
 ### F. Complete onboarding
 
-1. Sign in as Procurement.
+1. Sign in as Local SOA.
 2. Open the ticket and select the corrected Proof of Address.
 3. Approve it and select **Submit review**.
 
 Expected result:
 
 - Both documents are approved.
-- The ticket displays **Approved**.
+- The request moves to translation and then Indian SOA. It displays **Approved** only after Corporate Security approves all documents; continue with the downstream verification section below.
 - The database ticket and document states are `LOCAL_PROCUREMENT_ACCEPTED`.
 - Two background translation records progress through `PENDING`, `PROCESSING`, and `COMPLETED`.
 - English files are written under `server/uploads/<vendor-id>-<sanitized-vendor-name>/translated/`.
 - Translated filenames contain `translated-en-vN` and can be retrieved through the translation download endpoint.
-- Reopening the Procurement ticket shows the translation status and a **View English** button after completion.
+- Reopening the Local SOA ticket shows the translation status and a **View English** button after completion.
 
 Translation runs after the approval transaction commits, so a temporary LibreTranslate failure does not undo procurement approval. A failed request is recorded as `FAILED` with diagnostic text in `document_translations`. The generated English PDF is a readable review copy; it does not reproduce the original form layout.
 
 ### G. Verify separate reasons for two rejected documents
 
-Create a second ticket, upload both documents, and reject both during one procurement review. Enter a different reason in each document's reason field and submit.
+Create a second ticket, upload both documents, and reject both during one Local SOA review. Enter a different reason in each document's reason field and submit.
 
 Expected result: the Vendor page shows both rejected documents, each with its own matching rejection reason and upload control.
 
@@ -425,8 +432,8 @@ ORDER BY id DESC;
 | Database state | Meaning |
 | --- | --- |
 | `INIT` | Vendor action is required. This covers initial requests and rejected documents awaiting correction. |
-| `DOCUMENTS_UPLOADED` | Required uploads are ready for Local Procurement review. |
-| `LOCAL_PROCUREMENT_ACCEPTED` | Local Procurement has approved every requested document. |
+| `DOCUMENTS_UPLOADED` | Required uploads are ready for Local SOA review. |
+| `LOCAL_PROCUREMENT_ACCEPTED` | Local SOA has approved every requested document. |
 
 Rejection is recorded as an event in `document_review_events`. The affected document returns to `INIT`, retains its rejection reason, and can receive a new immutable upload version. This cycle continues until every requested document is accepted.
 
@@ -543,3 +550,69 @@ npm run dev
 ```
 
 The frontend has no build step. Refresh the browser after editing `index.html`.
+
+## Indian SOA and Corporate Security workflow
+
+### Upgrade and team accounts
+
+1. Back up the demo database. Stop the backend and run `server/migrations/006_downstream_reviews.sql` once in MySQL Workbench as root. Do not rerun older migrations on an up-to-date database. A fresh installation needs only `server/schema.sql`.
+2. Save three **distinct** team email addresses in `server/.env`:
+   ```dotenv
+   PROCUREMENT_ADMIN_EMAIL=local-team@example.com
+   INDIA_PROCUREMENT_EMAIL=india-team@example.com
+   CORPORATE_SECURITY_EMAIL=security-team@example.com
+   ```
+   These are placeholders. Use your test addresses and a different vendor address. Roles come only from these backend settings, not from browser input. Never commit `.env`.
+3. Restart **both** Node processes: backend (`node --use-system-ca src/server.js` from `server`) and frontend (`node start-frontend.js` from the repository root). The frontend allowlist now includes `workflow-ui.js`. Keep MySQL and LibreTranslate running. Press Ctrl+F5.
+4. Each team opens **Create account**, registers with its configured email, follows its verification email, and signs in. Existing verified accounts can sign in immediately. Use separate browser profiles or sign out when switching teams; tabs in the same browser share the session.
+5. Existing locally approved tickets enter translation/India review, **not** final approval. Completed translations are reused. Failed translations need Local SOA's **Retry translations** action.
+
+### Request stages and responsibilities
+
+| Current stage | Who acts | Next step |
+| --- | --- | --- |
+| Request creation | Indian SOA selects the vendor and requested documents | Vendor receives the initial document request |
+| Vendor upload | Vendor uploads requested/rejected files | Local SOA when all files are available |
+| Local SOA | Approve/reject uploaded versions; a reason is mandatory for each rejection | Translation after all local approvals; otherwise vendor corrections |
+| English translation | Local service translates the latest approved versions | Indian SOA initially, or Corporate Security after a Security correction |
+| Indian SOA | View Original and View English; submit document decisions | Corporate Security when all approved; rejected documents go directly to the vendor |
+| Corporate Security | View Original and View English; submit document decisions | Complete when all approved; rejected documents go directly to the vendor |
+| Complete | Read-only review and history | All teams approved |
+
+Downstream rejection immediately emails the vendor and opens only the rejected documents for replacement. Every replacement returns to Local SOA for approval and receives a new English translation. Indian SOA rejections return to Indian SOA after that cycle. Corporate Security rejections preserve the Indian SOA approval and return directly to Corporate Security after Local SOA approval and translation.
+
+### Email notification routing
+
+| Update | Email recipient |
+| --- | --- |
+| Indian SOA creates a document request | Vendor |
+| Vendor finishes the currently requested uploads | Local SOA |
+| Local SOA rejects a document | Vendor |
+| Local SOA approves all documents and translation completes | Indian SOA, or Corporate Security for a Security correction |
+| Indian SOA rejects a document | Vendor |
+| Indian SOA approves all documents | Corporate Security |
+| Corporate Security rejects a document | Vendor |
+| Corporate Security approves all documents | Vendor, Local SOA, and Indian SOA |
+
+Team handoff emails use the configured `PROCUREMENT_ADMIN_EMAIL`, `INDIA_PROCUREMENT_EMAIL`, and `CORPORATE_SECURITY_EMAIL` values. Vendor request and rejection emails remain visible in the Indian SOA Mail outbox. SMTP must be configured for delivery.
+
+Decisions are staged in the page until **Submit review**. Each rejected document needs its own reason (maximum 1,000 characters). Stale or out-of-stage reviews are rejected by the backend. Original and translated files remain available to all internal review teams.
+
+The request dashboard shows green completed steps, blue current steps, pending steps, and the correction route. Replacement uploads reset only affected progress; the history preserves earlier decisions and upload versions. Use **Refresh status** inside a request or **Refresh dashboard** after another team acts or translation finishes. When all currently requested files are uploaded, Local SOA receives an email. Vendor emails retain delivery status/retry in Indian SOA's mail outbox.
+
+### End-to-end demo verification
+
+1. Indian SOA creates a Mexico request with both documents; vendor registers and uploads two text-based PDFs. Confirm Local SOA receives the ready-for-review email.
+2. Local SOA approves both and submits. Wait for translations to complete; refresh. India review should become current, with both original and English buttons.
+3. Indian SOA approves the first and rejects the second with a reason, then submits. Confirm the vendor immediately receives the correction email and sees only the rejected file.
+4. Vendor uploads the replacement. Confirm the request goes to Local SOA.
+5. Vendor replaces that file. Confirm version increases, then Local SOA approves it, translation completes, and Indian SOA reviews it again. Unchanged-file approvals remain.
+6. India approves the remaining file. Confirm Security becomes current.
+7. Security rejects one or both files with separate reasons. Confirm the vendor receives the request directly. After vendor upload, Local SOA approval, and translation, confirm the request returns directly to Security without another Indian SOA review.
+8. Security approves all remaining files. Confirm the request is **Approved**, the flow is green, and no further review controls are enabled.
+9. Verify vendors cannot review documents, only Indian SOA can create requests, and no team can approve on another team's behalf.
+10. Simulate a translation failure: the request must remain in translation, never enter India review. Restore LibreTranslate and use **Retry translations**.
+
+Automated checks: run `npm test` from `server`. Tests cover routing, role restrictions, stale versions, mixed decisions, rejection reasons, replacement gating, translation completion, and role-specific UI rendering. Most tests use fake authentication/mail/database dependencies. To include the optional MySQL round-trip test after migration, run `$env:RUN_MYSQL_WORKFLOW_TEST='1'` followed by `npm test` in PowerShell. It inserts temporary records inside a transaction and rolls them back; it never sends email or writes upload files (auto-increment IDs may advance). Tests do not replace an end-to-end test with your configured accounts.
+
+The older `onboarding_tickets.status` remains for compatibility with local review. `workflow_stage` is authoritative for overall completion; only `COMPLETED` means all teams approved. This is a single-backend local demo, not a distributed workflow worker.

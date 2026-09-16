@@ -78,7 +78,7 @@ function createEnglishPdf({ documentName, originalFileName, translatedText }) {
   });
 }
 
-function createTranslationService({ pool, uploadRoot }) {
+function createTranslationService({ pool, uploadRoot, mail, env = process.env }) {
   const apiUrl = String(process.env.LIBRETRANSLATE_URL || 'http://127.0.0.1:5000').replace(/\/$/, '');
   const apiKey = String(process.env.LIBRETRANSLATE_API_KEY || '').trim();
   const targetLanguage = String(process.env.LIBRETRANSLATE_TARGET_LANGUAGE || 'en').toLowerCase();
@@ -185,11 +185,46 @@ function createTranslationService({ pool, uploadRoot }) {
     }
   }
 
-  function queueTicket(ticketId, retryFailed = false) {
-    setImmediate(() => translateTicket(ticketId, retryFailed)
-      .catch(error => console.error(`Ticket ${ticketId} translation failed:`, error.message)));
+  async function advance(ticketId) {
+    const c = await pool.getConnection();
+    let notification = null;
+    try {
+      await c.beginTransaction();
+      const [tickets] = await c.execute('SELECT ticket_number,workflow_stage FROM onboarding_tickets WHERE id=? FOR UPDATE', [ticketId]);
+      if (tickets[0]?.workflow_stage === 'TRANSLATION') {
+        const [docs] = await c.execute(`SELECT d.status,d.india_status,tr.status AS translation_status FROM ticket_documents d
+          LEFT JOIN document_uploads u ON u.id=(SELECT id FROM document_uploads WHERE ticket_document_id=d.id ORDER BY version_number DESC LIMIT 1)
+          LEFT JOIN document_translations tr ON tr.document_upload_id=u.id AND tr.target_language=? WHERE d.ticket_id=?`, [targetLanguage,ticketId]);
+        if (docs.length && docs.every(d => d.status === 'LOCAL_PROCUREMENT_ACCEPTED' && d.translation_status === 'COMPLETED')) {
+          const nextStage = docs.every(d => d.india_status === 'APPROVED') ? 'SECURITY' : 'INDIA';
+          await c.execute('UPDATE onboarding_tickets SET workflow_stage=? WHERE id=?', [nextStage, ticketId]);
+          await c.execute("INSERT INTO workflow_events (ticket_id,stage,action,actor_email,details) VALUES (?,'TRANSLATION','TRANSLATIONS_COMPLETED','system',?)", [ticketId, JSON.stringify({ nextStage })]);
+          const reference = tickets[0].ticket_number || ticketId;
+          notification = nextStage === 'SECURITY'
+            ? { to: env.CORPORATE_SECURITY_EMAIL, subject: `Documents ready for Corporate Security review — ${reference}`, message: `Corrected vendor documents for ${reference} passed Local SOA review and translation. They are ready for Corporate Security review.` }
+            : { to: env.INDIA_PROCUREMENT_EMAIL, subject: `Documents ready for Indian SOA review — ${reference}`, message: `Vendor documents for ${reference} passed Local SOA review and translation. They are ready for Indian SOA review.` };
+        }
+      }
+      await c.commit();
+      if (notification) mail?.queueTeam(notification);
+    } catch (e) { await c.rollback(); throw e; } finally { c.release(); }
   }
-  return { queueTicket, translateTicket, targetLanguage };
+  const active = new Set();
+  async function resume() {
+    const [tickets] = await pool.execute("SELECT id FROM onboarding_tickets WHERE workflow_stage='TRANSLATION'");
+    // A single local demo backend owns these jobs. Recover interrupted work.
+    await pool.execute("UPDATE document_translations SET status='PENDING' WHERE status='PROCESSING'");
+    for (const ticket of tickets) queueTicket(ticket.id);
+  }
+  function queueTicket(ticketId, retryFailed = false) {
+    if (active.has(String(ticketId))) return;
+    active.add(String(ticketId));
+    setImmediate(() => translateTicket(ticketId, retryFailed)
+      .then(() => advance(ticketId))
+      .catch(error => console.error(`Ticket ${ticketId} translation failed:`, error.message))
+      .finally(() => active.delete(String(ticketId))));
+  }
+  return { queueTicket, translateTicket, targetLanguage, advance, resume };
 }
 
 module.exports = { createTranslationService, sourceLanguageFor, splitText };

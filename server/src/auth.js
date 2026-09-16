@@ -15,10 +15,15 @@ function createAuth({ pool, env = process.env, clientFactory = createClient }) {
   const cookieName = 'vendor_session';
   function sid(req) { return (req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith(cookieName + '='))?.slice(cookieName.length + 1); }
   function clear(req, res) { sessions.delete(sid(req)); res.clearCookie(cookieName, { path: '/api', sameSite: 'lax', httpOnly: true }); }
+  const teamRoles = new Map();
+  for (const [key, role] of [['PROCUREMENT_ADMIN_EMAIL','procurement'],['INDIA_PROCUREMENT_EMAIL','india_procurement'],['CORPORATE_SECURITY_EMAIL','corporate_security']]) {
+    const email = normalizeEmail(env[key]);
+    if (email) { if (teamRoles.has(email)) throw new Error('Each procurement/security team must use a distinct email.'); teamRoles.set(email, role); }
+  }
   async function identity(user) {
     if (!user?.email_confirmed_at || !user.email) throw new Error('Verify your email before signing in.');
     const email = normalizeEmail(user.email);
-    if (email === normalizeEmail(env.PROCUREMENT_ADMIN_EMAIL)) return { id: user.id, email, role: 'procurement' };
+    if (teamRoles.has(email)) return { id: user.id, email, role: teamRoles.get(email) };
     const [rows] = await pool.execute('SELECT id FROM vendors WHERE LOWER(email) = ? LIMIT 1', [email]);
     if (!rows.length) throw new Error('No vendor invitation exists for this email.');
     return { id: user.id, email, role: 'vendor' };
@@ -76,7 +81,7 @@ function createAuth({ pool, env = process.env, clientFactory = createClient }) {
       try {
         const email = normalizeEmail(req.body.email);
         if (typeof req.body.password !== 'string' || req.body.password.length < 8) return res.status(400).json({ error: 'Use a password of at least 8 characters.' });
-        if (email !== normalizeEmail(env.PROCUREMENT_ADMIN_EMAIL)) {
+        if (!teamRoles.has(email)) {
           const [rows] = await pool.execute('SELECT id FROM vendors WHERE LOWER(email) = ? LIMIT 1', [email]);
           if (!rows.length) return res.status(403).json({ error: 'Use the email address from your vendor invitation.' });
         }
@@ -119,6 +124,15 @@ function createAuth({ pool, env = process.env, clientFactory = createClient }) {
     try {
       if (req.user.role === 'procurement') {
         if (/^\/ticket-documents\/[^/]+\/upload$/.test(req.path)) return res.status(403).json({ error: 'Only the vendor can upload documents.' });
+        if (req.method === 'POST' && req.path === '/tickets') return res.status(403).json({ error: 'Only Indian SOA can create vendor document requests.' });
+        if (req.body) req.body.reviewedByEmail = req.user.email;
+        return next();
+      }
+      if (['india_procurement','corporate_security'].includes(req.user.role)) {
+        const read = req.method === 'GET' && (/^\/tickets(?:\/[^/]+)?$/.test(req.path) || /^\/(uploads|translations)\/\d+$/.test(req.path) || req.path === '/notifications');
+        const review = req.method === 'POST' && /^\/tickets\/[^/]+\/review$/.test(req.path);
+        const indianSOAAction = req.user.role === 'india_procurement' && req.method === 'POST' && (req.path === '/tickets' || /^\/notifications\/\d+\/retry$/.test(req.path));
+        if (!read && !review && !indianSOAAction) return res.status(403).json({ error: 'This action is not available for your team.' });
         if (req.body) req.body.reviewedByEmail = req.user.email;
         return next();
       }
